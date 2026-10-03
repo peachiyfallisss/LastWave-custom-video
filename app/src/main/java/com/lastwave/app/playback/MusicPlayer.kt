@@ -139,6 +139,7 @@ data class VideoPlaybackState(
     val enabled: Boolean = false,
     val loading: Boolean = false,
     val error: String? = null,
+    val requestedVideo: Boolean? = null,
 )
 
 data class MusicPlayerState(
@@ -240,6 +241,7 @@ class MusicPlayer @Inject constructor(
     internal fun prepareForCast(): MusicPlayerState {
         val snapshot = _state.value
         pendingRestoredSession = null
+        cancelVideoPrefetch()
         cancelPendingPlaybackResolution()
         queueEnrichmentJob?.cancel()
         discoverQueueLoadJob?.cancel()
@@ -391,6 +393,13 @@ class MusicPlayer @Inject constructor(
     private var lastCrossfadeLogAtMs = 0L
     private val _state = MutableStateFlow(MusicPlayerState())
     val state: StateFlow<MusicPlayerState> = _state.asStateFlow()
+    private val playbackModeStreams = PlaybackModeStreamCache<ResolvedStream>(24)
+    private data class VideoPrefetch(
+        val mediaId: String,
+        val source: String,
+        val request: Deferred<ResolvedStream?>,
+    )
+    private var videoPrefetch: VideoPrefetch? = null
     private val _videoState = MutableStateFlow(VideoPlaybackState())
     val videoState: StateFlow<VideoPlaybackState> = _videoState.asStateFlow()
     /** The same player owns video sound, progress, focus, and system media controls. */
@@ -403,10 +412,13 @@ class MusicPlayer @Inject constructor(
         switchPlaybackMode(track, true)
     }
 
-    fun removeVideoSource(track: PlayableTrack) {
+    fun removeVideoSource(track: PlayableTrack) = onMain {
         trackVideos.remove(track)
+        if (videoPrefetch?.mediaId == track.mediaIdKey()) cancelVideoPrefetch()
         if (_videoState.value.mediaId == track.mediaIdKey() && (_videoState.value.enabled || _videoState.value.loading)) {
             switchPlaybackMode(track, false)
+        } else if (_state.value.current?.mediaIdKey() == track.mediaIdKey() && player.isPlaying) {
+            prefetchTrackVideo(track)
         }
     }
 
@@ -422,20 +434,30 @@ class MusicPlayer @Inject constructor(
             return@onMain
         }
         val source = if (video) trackVideos.sourceFor(track) else null
+        if (videoPrefetch?.let { it.mediaId != mediaId || (video && it.source != source) } == true) {
+            cancelVideoPrefetch()
+        }
         if (video && source == null) {
             _videoState.value = VideoPlaybackState(mediaId = mediaId, error = "Choose a video from your device or paste a video link.")
             return@onMain
         }
         val previousMode = _videoState.value
+        // Retain the exact active audio/video stream before replacement; do not re-search on return.
+        if (player.playerError == null) {
+            player.currentMediaItem?.localConfiguration?.customCacheKey?.let(preparedStreams::get)?.let { active ->
+                rememberPlaybackModeStream(mediaId, if (previousMode.enabled) previousMode.source else null, active)
+            }
+        }
         cancelPendingPlaybackResolution()
         cancelCrossfade()
         val generation = playRequestGeneration.get()
         val index = _state.value.currentIndex
         val wasPlaying = _state.value.isPlaying || player.playWhenReady
-        _videoState.value = VideoPlaybackState(mediaId, source, previousMode.enabled, loading = true)
+        _videoState.value = previousMode.copy(mediaId = mediaId, loading = true, error = null, requestedVideo = video)
         playRequest = applicationScope.launch(Dispatchers.IO) {
             try {
-                val resolved = if (video) trackVideos.resolve(source!!) else {
+                val resolved = playbackModeStreams.get(mediaId, source, System.currentTimeMillis() + 15_000L)
+                    ?: if (video) resolvePlaybackVideo(mediaId, source!!) else {
                     track.playbackUrl?.let { local ->
                         ResolvedStream(local, track.playbackMimeType ?: "audio/mpeg", null, null, "local:$local")
                     } ?: resolveTrackAudioStreamWithRetry(
@@ -448,6 +470,7 @@ class MusicPlayer @Inject constructor(
                     val position = player.currentPosition.coerceAtLeast(0L)
                         .let { pos -> resolved.durationMs?.takeIf { it > 0L }?.let { pos.coerceAtMost((it - 1L).coerceAtLeast(0L)) } ?: pos }
                     _videoState.value = VideoPlaybackState(mediaId, source, enabled = video)
+                    rememberPlaybackModeStream(mediaId, source, resolved)
                     registerPreparedStream(resolved)
                     _state.update { it.copy(audioCodec = null, bitrateKbps = null, bitDepth = null,
                         samplingRateKHz = null, isLossless = false, durationMs = resolved.durationMs ?: track.durationMs ?: 0L,
@@ -466,12 +489,62 @@ class MusicPlayer @Inject constructor(
             } catch (failure: Exception) {
                 withContext(Dispatchers.Main.immediate) {
                     if (generation == playRequestGeneration.get() && _state.value.current?.mediaIdKey() == mediaId) {
-                        _videoState.value = previousMode.copy(mediaId = mediaId, loading = false,
+                        _videoState.value = previousMode.copy(mediaId = mediaId, loading = false, requestedVideo = null,
                             error = failure.message ?: "Could not open this video.")
                     }
                 }
             }
         }
+    }
+
+    /** Resolve the selected video's URLs as soon as audio starts; keep audio playing. */
+    private fun prefetchTrackVideo(track: PlayableTrack) {
+        if (isCasting) return
+        val mediaId = track.mediaIdKey()
+        val source = trackVideos.sourceFor(track) ?: return
+        val pending = videoPrefetch
+        if (pending != null && (pending.mediaId != mediaId || pending.source != source)) cancelVideoPrefetch()
+        if (playbackModeStreams.get(mediaId, source, System.currentTimeMillis() + 15_000L) != null) return
+        if (videoPrefetch?.let { it.mediaId == mediaId && it.source == source && !it.request.isCompleted } == true) return
+        val request = applicationScope.async(Dispatchers.IO) {
+            try {
+                val resolved = trackVideos.resolve(source)
+                currentCoroutineContext().ensureActive()
+                rememberPlaybackModeStream(mediaId, source, resolved)
+                resolved
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (failure: Exception) {
+                // Optional background work must not interrupt the song or show a playback error.
+                android.util.Log.d("MusicPlayer", "Video prefetch unavailable for $mediaId", failure)
+                null
+            }
+        }
+        videoPrefetch = VideoPrefetch(mediaId, source, request)
+    }
+
+    private suspend fun resolvePlaybackVideo(mediaId: String, source: String): ResolvedStream {
+        // A tap during prefetch shares that request instead of extracting the video twice.
+        val pending = withContext(Dispatchers.Main.immediate) {
+            videoPrefetch?.takeIf { it.mediaId == mediaId && it.source == source && !it.request.isCompleted }?.request
+        }
+        pending?.await()
+        return playbackModeStreams.get(mediaId, source, System.currentTimeMillis() + 15_000L)
+            ?: trackVideos.resolve(source)
+    }
+
+    private fun cancelVideoPrefetch() {
+        videoPrefetch?.request?.cancel()
+        videoPrefetch = null
+    }
+
+    private fun rememberPlaybackModeStream(mediaId: String, source: String?, stream: ResolvedStream) {
+        val now = System.currentTimeMillis()
+        val knownExpiry = listOfNotNull(stream.expiresAtEpochMs, stream.youtubeCandidate?.expiresAtEpochMs,
+            stream.companionAudio?.expiresAtEpochMs).minOrNull()
+        val local = stream.url.startsWith("content:") || stream.url.startsWith("file:") || stream.url.startsWith("/")
+        val validUntil = if (local) Long.MAX_VALUE else minOf(knownExpiry ?: (now + 120_000L), now + 900_000L)
+        playbackModeStreams.put(mediaId, source, stream, validUntil)
     }
 
     val chromeState: StateFlow<PlaybackChromeState> = state
@@ -720,10 +793,12 @@ class MusicPlayer @Inject constructor(
                 unavailableSkipJob?.cancel()
                 unavailableSkipJob = null
                 player.currentMediaItem?.mediaId?.let(unavailableMediaIds::remove)
+                if (!isCasting) player.currentMediaItem?.toPlayableTrack()?.let(::prefetchTrackVideo)
             }
         }
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             if (isCasting) return
+            if (videoPrefetch?.mediaId != mediaItem?.mediaId) cancelVideoPrefetch()
             val videoMode = _videoState.value
             if (videoMode.mediaId != null && mediaItem?.mediaId != videoMode.mediaId) {
                 _videoState.value = VideoPlaybackState()
@@ -832,6 +907,7 @@ class MusicPlayer @Inject constructor(
                         publishLocalTrackQuality(currentTrack)
                     }
                 }
+                if (player.isPlaying) prefetchTrackVideo(currentTrack)
                 updateBitPerfectState()
                 enrichUpcomingQueue(currentIndex)
                 extendDiscoverQueueIfNeeded(currentIndex)
@@ -858,6 +934,9 @@ class MusicPlayer @Inject constructor(
             // network blips) are transient, while genuinely dead tracks fail
             // before producing audible playback. Holding with tap-to-retry
             // stops one bad stretch from eating the whole queue 3s at a time.
+            currentTrack?.mediaIdKey()?.let { mediaId ->
+                playbackModeStreams.remove(mediaId, if (_videoState.value.enabled) _videoState.value.source else null)
+            }
             if (_videoState.value.enabled && _videoState.value.mediaId == player.currentMediaItem?.mediaId) {
                 player.pause()
                 val message = "Video playback failed. Switch to Audio, or choose the video again to retry."
@@ -3609,7 +3688,7 @@ class MusicPlayer @Inject constructor(
 
     private fun cancelPendingPlaybackResolution() {
         playRequestGeneration.incrementAndGet()
-        _videoState.update { it.copy(loading = false) }
+        _videoState.update { it.copy(loading = false, requestedVideo = null) }
         playRequest?.cancel()
         playRequest = null
         cancelActiveUpgrade()
@@ -3733,6 +3812,7 @@ class MusicPlayer @Inject constructor(
      */
     fun stopAndClear(clearSession: Boolean = true) = onMain {
         if (isCasting) castPlayback?.disconnect()
+        cancelVideoPrefetch()
         cancelCrossfade()
         resolutionRequests.values.forEach { it.second.cancel() }
         resolutionRequests.clear()
@@ -3750,6 +3830,7 @@ class MusicPlayer @Inject constructor(
         // fresh state says off — until the first refresh() flips it back on.
         player.shuffleModeEnabled = false
         preparedStreams.clear()
+        playbackModeStreams.clear()
         _state.value = MusicPlayerState()
         if (clearSession) clearPersistedPlaybackSession()
         applicationScope.launch(Dispatchers.IO) { WidgetUpdater.clear(appContext) }

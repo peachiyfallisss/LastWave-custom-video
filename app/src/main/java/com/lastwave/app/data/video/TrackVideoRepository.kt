@@ -19,7 +19,7 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Store stable page/document URIs; signed CDN URLs are resolved afresh on every switch. */
+/** Store stable page/document URIs; signed CDN URLs are resolved ahead of playback and refreshed when needed. */
 @Singleton
 class TrackVideoRepository @Inject constructor(
     @ApplicationContext context: Context,
@@ -142,5 +142,6 @@ class TrackVideoRepository @Inject constructor(
     }
 
     private fun stream(url: String, mime: String, key: String, headers: Map<String, String> = emptyMap(), duration: Long? = null) =
-        MusicPlayer.ResolvedStream(url, mime, null, null, key, requestHeaders = headers, durationMs = duration)
+        MusicPlayer.ResolvedStream(url, mime, null, null, key, requestHeaders = headers, durationMs = duration,
+            expiresAtEpochMs = url.toHttpUrlOrNull()?.queryParameter("deadline")?.toLongOrNull()?.times(1_000L))
 }

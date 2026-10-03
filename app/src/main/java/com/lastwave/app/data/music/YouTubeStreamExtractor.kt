@@ -100,12 +100,14 @@ class YouTubeStreamExtractor @Inject constructor(
                     url = selected.content, mimeType = selected.format?.mimeType ?: "audio/mp4",
                     bitrateKbps = maxOf(selected.averageBitrate, selected.bitrate).takeIf { it > 0 },
                     audioCodec = selected.codec, cacheKey = "$cacheKey:audio", requestHeaders = headers, durationMs = duration,
+                    expiresAtEpochMs = selected.content.toHttpUrlOrNull()?.queryParameter("expire")?.toLongOrNull()?.times(1_000L),
                 )
             } else null
             com.lastwave.app.playback.MusicPlayer.ResolvedStream(
                 url = video.content, mimeType = video.format?.mimeType ?: "video/mp4",
                 bitrateKbps = audio?.bitrateKbps, audioCodec = audio?.audioCodec,
                 cacheKey = cacheKey, requestHeaders = headers, durationMs = duration, companionAudio = audio,
+                expiresAtEpochMs = video.content.toHttpUrlOrNull()?.queryParameter("expire")?.toLongOrNull()?.times(1_000L),
             )
         }
 

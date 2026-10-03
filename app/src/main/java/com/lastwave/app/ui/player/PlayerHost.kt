@@ -16,6 +16,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.lastwave.app.ui.common.PredictiveBackScreen
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -1702,6 +1703,7 @@ private fun FullPlayer(
         }
     }
     var showTrackMenu by remember(track.videoId, track.title) { mutableStateOf(false) }
+    var showVideoSources by remember(track.videoId, track.title) { mutableStateOf(false) }
     var artworkDragX by remember(track.videoId, track.title) { mutableFloatStateOf(0f) }
     var dismissDragY by remember(track.videoId, track.title) { mutableFloatStateOf(0f) }
     var isDismissDragging by remember { mutableStateOf(false) }
@@ -2271,7 +2273,7 @@ private fun FullPlayer(
                                     Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(bottom = 18.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                 ) {
-                                    TrackVideoControls(track, player)
+                                    TrackVideoControls(player)
                                     val sleeveAlpha by animateFloatAsState(
                                         targetValue = if (showFullBleed) 0f else 1f,
                                         animationSpec = tween(350),
@@ -2440,18 +2442,21 @@ private fun FullPlayer(
                                                     },
                                             ) {
                                                 Box(Modifier.fillMaxSize()) {
-                                                    if (isVideoActive) {
-                                                        TrackVideoSurface(player, state.isPlaying, Modifier.fillMaxSize())
-                                                    } else {
-                                                        PlayerArtwork(
-                                                            track = track,
-                                                            modifier = Modifier.fillMaxSize(),
-                                                            corner = 32.dp,
-                                                            canvas = if (showSleeveCanvas) canvas else null,
-                                                            isPlaying = state.isPlaying,
-                                                            pausedForTransition = shownDismissY > 0f || currentTab != FullPlayerTab.NOW_PLAYING,
-                                                            onAspectRatioChanged = { canvasAspect = it },
-                                                        )
+                                                    Crossfade(targetState = isVideoActive,
+                                                        animationSpec = tween(180), label = "audioVideoArtwork") { videoVisible ->
+                                                        if (videoVisible) {
+                                                            TrackVideoSurface(player, state.isPlaying, Modifier.fillMaxSize())
+                                                        } else {
+                                                            PlayerArtwork(
+                                                                track = track,
+                                                                modifier = Modifier.fillMaxSize(),
+                                                                corner = 32.dp,
+                                                                canvas = if (showSleeveCanvas) canvas else null,
+                                                                isPlaying = state.isPlaying,
+                                                                pausedForTransition = shownDismissY > 0f || currentTab != FullPlayerTab.NOW_PLAYING,
+                                                                onAspectRatioChanged = { canvasAspect = it },
+                                                            )
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2751,6 +2756,7 @@ private fun FullPlayer(
             }
         }
     }
+    TrackVideoSourcePicker(track, player, visible = showVideoSources, onDismiss = { showVideoSources = false })
     if (showTrackMenu) {
         TrackContextMenuSheet(
             target = TrackMenuTarget.Track(track.title, track.artist, ""),
@@ -2761,6 +2767,7 @@ private fun FullPlayer(
             playableTrack = track,
             onDismiss = { showTrackMenu = false },
             onPlayInLastWave = { player.play(track, sourceLabel = state.sourceLabel) },
+            onChooseVideo = { showVideoSources = true },
         )
     }
     if (showLyricsOffsetDialog && onSetLyricsOffsetMs != null) {

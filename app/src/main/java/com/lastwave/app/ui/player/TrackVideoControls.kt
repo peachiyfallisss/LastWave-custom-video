@@ -7,12 +7,21 @@ import android.graphics.Matrix
 import android.view.TextureView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -21,14 +30,76 @@ import androidx.media3.common.VideoSize
 import com.lastwave.app.playback.MusicPlayer
 import com.lastwave.app.playback.PlayableTrack
 
+/** Explicit overlay colors keep the mode switch readable over light and dark artwork. */
 @Composable
-internal fun TrackVideoControls(track: PlayableTrack, player: MusicPlayer) {
+internal fun TrackVideoControls(player: MusicPlayer) {
     val mode by player.videoState.collectAsStateWithLifecycle()
+    Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp), contentAlignment = Alignment.Center) {
+        Surface(
+            color = Color(0xFF181A20),
+            contentColor = Color.White,
+            shape = CircleShape,
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.18f)),
+            shadowElevation = 4.dp,
+        ) {
+            Row(Modifier.width(224.dp).padding(4.dp).selectableGroup()) {
+                listOf(false to "Audio", true to "Video").forEach { (video, label) ->
+                    val active = mode.enabled == video
+                    Surface(
+                        onClick = { if (!active) player.setVideoEnabled(video) },
+                        enabled = !mode.loading,
+                        color = if (active) Color.White else Color.Transparent,
+                        contentColor = if (active) Color(0xFF181A20) else Color.White,
+                        shape = CircleShape,
+                        modifier = Modifier.weight(1f).height(44.dp).semantics {
+                            selected = active
+                            role = Role.Tab
+                        },
+                    ) {
+                        Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically) {
+                            Text(label, style = MaterialTheme.typography.labelLarge,
+                                fontWeight = if (active) FontWeight.Bold else FontWeight.Medium)
+                            if (mode.loading && video == mode.requestedVideo) {
+                                Spacer(Modifier.width(6.dp))
+                                CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp,
+                                    color = if (active) Color(0xFF181A20) else Color.White)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mode.error?.let { message ->
+        Surface(color = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+            Text(message, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(12.dp))
+        }
+    }
+}
+
+/** Always composed so the document-picker callback survives dismissing the source dialog. */
+@Composable
+internal fun TrackVideoSourcePicker(
+    track: PlayableTrack,
+    player: MusicPlayer,
+    visible: Boolean,
+    onDismiss: () -> Unit,
+) {
     val context = LocalContext.current
-    var showSources by remember(track) { mutableStateOf(false) }
     var link by remember(track) { mutableStateOf(player.videoSource(track).orEmpty().takeUnless { it.startsWith("content:") }.orEmpty()) }
     var localError by remember(track) { mutableStateOf<String?>(null) }
+    var fileError by remember { mutableStateOf<String?>(null) }
     var pendingFileTrack by remember { mutableStateOf<PlayableTrack?>(null) }
+    LaunchedEffect(visible, track) {
+        if (visible) {
+            link = player.videoSource(track).orEmpty().takeUnless { it.startsWith("content:") }.orEmpty()
+            localError = null
+        }
+    }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val target = pendingFileTrack
         pendingFileTrack = null
@@ -36,23 +107,12 @@ internal fun TrackVideoControls(track: PlayableTrack, player: MusicPlayer) {
             runCatching {
                 context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 player.setVideoSource(target, uri.toString())
-            }.onFailure { localError = "Could not keep access to this file. Choose it from device storage." }
+            }.onFailure { fileError = "Could not keep access to this file. Choose it from device storage." }
         }
     }
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-        TextButton(onClick = { player.setVideoEnabled(false) }, enabled = !mode.loading && mode.enabled) { Text("Audio") }
-        TextButton(onClick = { player.setVideoEnabled(true) }, enabled = !mode.loading) {
-            Text(if (mode.loading) "Opening…" else if (mode.enabled) "Video ✓" else "Video")
-        }
-        TextButton(onClick = { showSources = true }) { Text("Choose video") }
-    }
-    (localError ?: mode.error)?.let { message ->
-        Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp))
-    }
-    if (showSources) {
+    if (visible) {
         AlertDialog(
-            onDismissRequest = { showSources = false },
+            onDismissRequest = onDismiss,
             title = { Text("Video for ${track.title}") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -62,11 +122,11 @@ internal fun TrackVideoControls(track: PlayableTrack, player: MusicPlayer) {
                     localError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     TextButton(onClick = {
                         pendingFileTrack = track
-                        showSources = false
+                        onDismiss()
                         picker.launch(arrayOf("video/*"))
                     }) { Text("Choose from device") }
                     if (player.videoSource(track) != null) {
-                        TextButton(onClick = { player.removeVideoSource(track); link = ""; showSources = false }) {
+                        TextButton(onClick = { player.removeVideoSource(track); link = ""; onDismiss() }) {
                             Text("Remove custom video")
                         }
                     }
@@ -75,12 +135,16 @@ internal fun TrackVideoControls(track: PlayableTrack, player: MusicPlayer) {
             confirmButton = {
                 TextButton(enabled = link.isNotBlank(), onClick = {
                     runCatching { player.setVideoSource(track, link) }
-                        .onSuccess { showSources = false; localError = null }
+                        .onSuccess { onDismiss(); localError = null }
                         .onFailure { localError = it.message ?: "Invalid video link." }
                 }) { Text("Use video") }
             },
-            dismissButton = { TextButton(onClick = { showSources = false }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
         )
+    }
+    fileError?.let { message ->
+        AlertDialog(onDismissRequest = { fileError = null }, title = { Text("Could not open video") },
+            text = { Text(message) }, confirmButton = { TextButton(onClick = { fileError = null }) { Text("OK") } })
     }
 }
 

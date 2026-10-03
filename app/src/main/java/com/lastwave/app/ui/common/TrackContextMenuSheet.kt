@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.Sell
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.OutlinedTextField
@@ -289,6 +290,7 @@ fun TrackContextMenuSheet(
     onRefreshArtwork: (() -> Unit)? = null,
     onRemoveFromPlaylist: (() -> Unit)? = null,
     onRemoveFromQueue: (() -> Unit)? = null,
+    onChooseVideo: (() -> Unit)? = null,
     genreResolverViewModel: GenreRowViewModel = hiltViewModel(),
     startMixViewModel: StartMixMenuViewModel = hiltViewModel(),
     exploreGenreViewModel: ExploreGenreMenuViewModel = hiltViewModel(),
@@ -474,6 +476,14 @@ fun TrackContextMenuSheet(
                 )
                 val rows = buildList<@Composable (GroupPosition) -> Unit> {
                     val t = target
+                    if (onChooseVideo != null) {
+                        add { pos ->
+                            MenuActionRow(Icons.Filled.VideoLibrary, "Choose video", position = pos) {
+                                onDismiss()
+                                onChooseVideo()
+                            }
+                        }
+                    }
                     if (resolvingGenre || !resolvedGenre.isNullOrBlank()) {
                         add { pos ->
                             val genre = resolvedGenre
