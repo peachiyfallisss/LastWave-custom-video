@@ -1,0 +1,74 @@
+name: Publish verified custom video APK
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/publish-custom-video-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: publish-v4.2.2-custom-video.2
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'peachiyfallisss/LastWave-custom-video'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_RUN: '37139757753'
+      SOURCE_SHA: fc86ea4ac362bf55ad3f5e253bf260e95891ce8d
+      RELEASE_TAG: v4.2.2-custom-video.2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fc86ea4ac362bf55ad3f5e253bf260e95891ce8d
+          persist-credentials: false
+      - name: Verify successful build and download its APK
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN" --jq '.conclusion')" = success
+          test "$(gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN" --jq '.head_sha')" = "$SOURCE_SHA"
+          gh run download "$BUILD_RUN" --repo "$GH_REPO" --name LastWave-custom-video-debug --dir artifact
+          python3 - <<'PY'
+          import hashlib
+          import shutil
+          from pathlib import Path
+          apks = list(Path("artifact").rglob("*.apk"))
+          checksums = list(Path("artifact").rglob("*.apk.sha256"))
+          assert len(apks) == 1 and len(checksums) == 1, "Expected one APK and its checksum"
+          apk = apks[0]
+          expected = checksums[0].read_text().split()[0]
+          actual = hashlib.sha256(apk.read_bytes()).hexdigest()
+          assert actual == expected, "Downloaded APK checksum does not match the successful build"
+          dest = Path("dist")
+          dest.mkdir()
+          name = "LastWave-custom-video-debug.apk"
+          shutil.copy2(apk, dest / name)
+          (dest / (name + ".sha256")).write_text(f"{actual}  {name}\n")
+          print(f"Verified APK SHA-256: {actual}")
+          PY
+      - name: Package exact built source and release notes
+        run: |
+          set -euo pipefail
+          git archive --format=zip --prefix=LastWave-native/ --output=dist/LastWave-custom-video-source.zip "$SOURCE_SHA"
+          cat > release-notes.md <<'NOTES'
+          The Audio/Video controls are now easier to see, video selection is under the three-dot menu, and selecting a mode no longer shows a checkmark.
+
+          Video lookup starts in the background when each song begins. Switching reuses resolved sources, shares any pending lookup, and uses a short visual fade. The video can still need time to buffer.
+
+          **Download:** LastWave-custom-video-debug.apk below. Android 10 or newer; package com.lastwave.app.custom.
+
+          Built from commit fc86ea4ac362bf55ad3f5e253bf260e95891ce8d.
+          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37139757753).
+          Recording/cache regression checks, Android unit tests, APK compilation, and APK v2 signature verification passed.
+
+          The checksum and matching source archive are included. Playback timing still requires checking on a phone.
+          NOTES
+      - name: Publish release and attach verified files
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$SOURCE_SHA" --title "LastWave custom video — player update" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
