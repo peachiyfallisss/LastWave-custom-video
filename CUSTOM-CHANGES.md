@@ -2,7 +2,18 @@
 
 Prepared from Clash-Projects/LastWave-Native commit `97c68d5ace29da2363023e3f3d7723859a7061a0`.
 
-This is modified source, not a verified APK. No upstream repository or account was changed.
+This is modified source for a custom debug APK. No upstream repository or account was changed.
+
+## Compilation completed on October 3, 2026
+
+- Uploaded to the private repository `peachiyfallisss/LastWave-custom-video`.
+- [GitHub Actions build](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37136012271) succeeded for source commit `4ff9a4a17c5b2d3bee78e434d8d990ce6b1b89a6`.
+- `testDebugUnitTest assembleDebug` passed: 233 unit tests, zero failures, zero skipped. The standalone recording-identity check also passed all 27 scenarios.
+- Verified the APK's v2 signature and package `com.lastwave.app.custom`, version `4.2.2-custom-video`, minimum Android API 29. Native libraries include arm64-v8a, armeabi-v7a, x86, and x86_64.
+- Fixed the obsolete Android SDK setup action, explicitly selected SDK platform 37.0 with `compileSdkMinor = 0`, and supplied the missing `allowLossless` argument when restoring audio playback, honoring the existing lossless bypass setting.
+- [Private release downloads](https://github.com/peachiyfallisss/LastWave-custom-video/releases/tag/v4.2.2-custom-video) include the APK, its SHA-256 checksum, and the exact built source archive.
+- SHA-256: `ce728f8aa26e54716a19ecd222ce40f0c97ae5fffa2ab0a0ea899e7a4164782c`.
+- This compilation does not validate real-device installation, YouTube/Bilibili playback, or badge behavior. No upstream addon credentials were included.
 
 ## Changes
 
@@ -15,7 +26,7 @@ This is modified source, not a verified APK. No upstream repository or account w
 - YouTube controls badge eligibility; successful history submission does not guarantee badges. No silent parallel playback or artificial extra listens were added.
 - Debug builds use `com.lastwave.app.custom`, so they can be installed alongside the original app. Sign in and configure the custom app separately. Its data is separate from the original app.
 
-## Validation completed here
+## Historical validation recorded in the supplied archive
 
 - 27 Java recording-identity regression scenarios passed with the actual Java implementation, including live vs studio, album-only live labels, Unicode markers, display-only video labels, and ordinary titles such as Live Forever.
 - New Kotlin source files passed a tree-sitter syntax check. Modified large files were compared with the upstream baseline; the grammar's existing unsupported constructs remain, with no new reported error spans. This is not Kotlin type checking.
@@ -36,7 +47,7 @@ bash gradlew testDebugUnitTest assembleDebug
 
 On Windows, run `gradlew.bat testDebugUnitTest assembleDebug` from a terminal in the folder.
 
-4. The output should be `app/build/outputs/apk/debug/app-debug.apk`. Copy it to the phone and install it. This source has not yet been compiled; address any compiler/dependency errors before installing.
+4. The output should be `app/build/outputs/apk/debug/app-debug.apk`. Copy it to the phone and install it. The source commit listed above was compiled successfully; address any errors introduced by later changes before installing.
 
 ## Build using GitHub Actions
 

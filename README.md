@@ -5,12 +5,15 @@ derived from Clash-Projects/LastWave-Native commit
 97c68d5ace29da2363023e3f3d7723859a7061a0. Upstream licensing and attribution are
 preserved below and in LICENSE.
 
-- Build: Actions -> Build custom LastWave video APK.
+- Download the compiled APK: [custom video release](https://github.com/peachiyfallisss/LastWave-custom-video/releases/tag/v4.2.2-custom-video).
+- Verified build: [GitHub Actions run](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37136012271) on October 3, 2026. All 233 unit tests and 27 standalone recording checks passed; the APK signature was verified.
+- Build again: Actions -> Build custom LastWave video APK.
 - Download: open a successful run and download LastWave-custom-video-debug.
 - Package: com.lastwave.app.custom (installs alongside the original app).
 - Requirements: Android 10 or newer. Sign in and configure this app separately.
 - Source changes and device checks: see CUSTOM-CHANGES.md.
 - Debug builds do not contain upstream addon credentials or a release signing key.
+- Real-device playback and installation have not been tested. This remains a custom debug prototype, not an upstream production release.
 - Original release workflows remain available for manual use; the automatic
   main-branch workflow only builds/tests the custom debug app.
 
