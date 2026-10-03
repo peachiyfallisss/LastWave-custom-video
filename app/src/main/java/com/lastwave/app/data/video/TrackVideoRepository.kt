@@ -142,7 +142,13 @@ class TrackVideoRepository @Inject constructor(
                     try {
                         response.use {
                             if (!it.isSuccessful) throw IOException("Video download failed (HTTP ${it.code}).")
+                            if (it.code == 206) {
+                                val range = Regex("bytes 0-([0-9]+)/([0-9]+)").matchEntire(it.header("Content-Range").orEmpty())
+                                if (range == null || range.groupValues[1].toLong() + 1 != range.groupValues[2].toLong())
+                                    throw IOException("Video server returned only part of the file.")
+                            }
                             val body = it.body ?: throw IOException("Empty video response.")
+                            if (body.contentType()?.type == "text") throw IOException("Video server returned a page instead of media.")
                             val expected = body.contentLength()
                             var count = 0L
                             body.byteStream().use { input -> destination.outputStream().use { out ->

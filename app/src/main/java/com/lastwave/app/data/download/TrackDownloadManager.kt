@@ -437,6 +437,7 @@ class TrackDownloadManager @Inject constructor(
         videoId: String? = null,
         durationMs: Long? = null,
         includeVideo: Boolean = false,
+        playbackUrl: String? = null,
     ) {
         val key = makeDownloadKey(title, artist)
         // Admission and job registration share [admissionLock] with the wipe so a
@@ -446,7 +447,7 @@ class TrackDownloadManager @Inject constructor(
             if (!activeKeys.add(key)) return
             reconnectGenerations[key] = AtomicLong()
             val job = applicationScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo)
+                runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl)
             }
             activeJobs[key] = job
             job.start()
@@ -463,6 +464,7 @@ class TrackDownloadManager @Inject constructor(
         videoId: String?,
         durationMs: Long?,
         includeVideo: Boolean,
+        playbackUrl: String?,
     ) {
             // Bound the number of simultaneous downloads: each one holds
             // sockets, buffers and (during tagging) a decoded cover bitmap,
@@ -509,7 +511,7 @@ class TrackDownloadManager @Inject constructor(
                 if (fileStillPresent && DownloadRecordingPolicy.mayReuseFile(videoId, storedVideoId)) {
                     try {
                         if (includeVideo) {
-                            val videoError = downloadVideoExtra(key, existing, PlayableTrack(title, artist, album, videoId = videoId, durationMs = durationMs), storedVideoId)
+                            val videoError = downloadVideoExtra(key, existing, PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl, durationMs = durationMs), storedVideoId)
                             updateProgress(DownloadProgress(key, title, artist, 100,
                                 formatBadge = if (videoError == null) "AUDIO + VIDEO" else existing.formatBadge,
                                 isFinished = true, error = videoError))
@@ -1793,7 +1795,7 @@ class TrackDownloadManager @Inject constructor(
                 // A video cancellation/failure must not delete a completed audio download.
                 activeUris.remove(key)
                 activeFiles.remove(key)
-                val videoError = if (includeVideo) downloadVideoExtra(key, entity, PlayableTrack(title, artist, album, videoId = videoId, durationMs = durationMs), resolvedYtVideoId) else null
+                val videoError = if (includeVideo) downloadVideoExtra(key, entity, PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl, durationMs = durationMs), resolvedYtVideoId) else null
                 val finishedBadge = if (includeVideo && videoError == null) "$formatBadge + VIDEO" else formatBadge
                 updateProgress(
                     DownloadProgress(

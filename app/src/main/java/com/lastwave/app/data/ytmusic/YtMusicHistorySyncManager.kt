@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -107,6 +108,9 @@ class YtMusicHistorySyncManager @Inject constructor(
             if (preferences.pendingHistory.first().isNotEmpty()) YtHistorySyncWorker.schedule(context)
         }
         applicationScope.launch(Dispatchers.Main.immediate) {
+            // Hydration is not an account switch; do not cancel a worker started by Android.
+            activeAccount = ytAuth.awaitLoadedConnection()
+            historyEnabled = preferences.historySyncEnabled.first()
             combine(musicPlayer.get().state, ytAuth.connection, preferences.historySyncEnabled) { state, account, enabled ->
                 Triple(state, account, enabled)
             }.collect { (state, account, enabled) ->
@@ -200,7 +204,13 @@ class YtMusicHistorySyncManager @Inject constructor(
     }
 
     /** Returns false for deferred work; WorkManager retries when the network is available. */
-    suspend fun flushPendingHistory(): Boolean = flushMutex.withLock {
+    suspend fun flushPendingHistory(): Boolean {
+        val job = currentCoroutineContext()[Job]
+        if (job != null) activeSubmissions.add(job)
+        return try { drainPendingHistory() } finally { if (job != null) activeSubmissions.remove(job) }
+    }
+
+    private suspend fun drainPendingHistory(): Boolean = flushMutex.withLock {
         val network = context.getSystemService(ConnectivityManager::class.java)
         val capabilities = network?.getNetworkCapabilities(network.activeNetwork)
         if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) != true) {

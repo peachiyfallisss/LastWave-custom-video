@@ -173,6 +173,7 @@ class DownloadMenuViewModel @Inject constructor(
         videoId: String? = null,
         durationMs: Long? = null,
         includeVideo: Boolean = false,
+        playbackUrl: String? = null,
     ) {
         downloadManager.downloadTrack(
             title = title,
@@ -182,6 +183,7 @@ class DownloadMenuViewModel @Inject constructor(
             videoId = videoId,
             durationMs = durationMs,
             includeVideo = includeVideo,
+            playbackUrl = playbackUrl,
         )
         routeNavigator.navigateTo(com.lastwave.app.ui.navigation.Screen.Downloads.route)
     }
@@ -339,7 +341,7 @@ fun TrackContextMenuSheet(
     pendingDownload?.let { track ->
         DownloadOptionsDialog(onDismiss = { pendingDownload = null }, onDownload = { includeVideo ->
             downloadViewModel.download(track.title, track.artist, track.album, track.artworkUrl,
-                track.videoId, track.durationMs, includeVideo)
+                track.videoId, track.durationMs, includeVideo, track.playbackUrl)
             pendingDownload = null
             onDismiss()
         })

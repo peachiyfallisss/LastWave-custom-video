@@ -2172,37 +2172,42 @@ class InnerTubeMusicApi @Inject constructor(
         if (ordered.isEmpty()) return@coroutineScope null
 
         val channel = kotlinx.coroutines.channels.Channel<YouTubeAudioStream>(ordered.size)
+        val remaining = java.util.concurrent.atomic.AtomicInteger(ordered.size)
         val jobs = ordered.mapIndexed { index, client ->
             launch(Dispatchers.IO) {
-                // Hedged stagger: each client gets a short head start over the
-                // next, but a slow client never serializes a full timeout
-                // onto the ones behind it.
-                if (index > 0) {
-                    delay(DIRECT_FAST_STAGGER_MS * index)
-                    if (!isActive) return@launch
-                }
-                val stream = try {
-                    kotlinx.coroutines.withTimeoutOrNull(DIRECT_FAST_CLIENT_TIMEOUT_MS) {
-                        resolveDirectClientStream(
-                            videoId = videoId,
-                            client = client,
-                            visitorData = visitorData,
-                            signatureTimestamp = null,
-                            playerPoToken = null,
-                            gvsPoToken = null,
-                            authScope = authScope,
-                            probeCandidates = false,
-                            allowCipherFormats = false,
-                        )
+                try {
+                    // Hedged stagger: each client gets a short head start over the
+                    // next, but a slow client never serializes a full timeout
+                    // onto the ones behind it.
+                    if (index > 0) {
+                        delay(DIRECT_FAST_STAGGER_MS * index)
+                        if (!isActive) return@launch
                     }
-                } catch (cancellation: kotlinx.coroutines.CancellationException) {
-                    throw cancellation
-                } catch (_: Exception) {
-                    null
-                }
-                if (stream != null) {
-                    lastSuccessfulClientName = client.name
-                    channel.trySend(stream)
+                    val stream = try {
+                        kotlinx.coroutines.withTimeoutOrNull(DIRECT_FAST_CLIENT_TIMEOUT_MS) {
+                            resolveDirectClientStream(
+                                videoId = videoId,
+                                client = client,
+                                visitorData = visitorData,
+                                signatureTimestamp = null,
+                                playerPoToken = null,
+                                gvsPoToken = null,
+                                authScope = authScope,
+                                probeCandidates = false,
+                                allowCipherFormats = false,
+                            )
+                        }
+                    } catch (cancellation: kotlinx.coroutines.CancellationException) {
+                        throw cancellation
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (stream != null) {
+                        lastSuccessfulClientName = client.name
+                        channel.trySend(stream)
+                    }
+                } finally {
+                    if (remaining.decrementAndGet() == 0) channel.close()
                 }
             }
         }
@@ -2221,56 +2226,44 @@ class InnerTubeMusicApi @Inject constructor(
     ): YouTubeAudioStream = kotlinx.coroutines.coroutineScope {
         val now = System.currentTimeMillis()
 
-        // 0. Direct-URL fast path (limusic-style): VISIONOS → ANDROID_VR →
-        // TVHTML5, one player POST each, first direct-URL audio format wins.
-        // No webConfig fetch, no signatureTimestamp, no poToken, no Rhino
-        // decipher, no probe — these clients serve ready URLs. Typical
-        // 1-3s. Miss falls through to the full chain below.
-        resolveDirectUrlFastPath(videoId, authScope)?.let { fast ->
-            cacheResolvedStream(fast, now)
-            lastResolvedStreams[resolutionKey(videoId, authScope)] = fast
-            logStreamEvent("direct-fast-resolved", fast)
-            logStage(videoId, "direct-fast", startedAt)
-            return@coroutineScope fast
-        }
-
-        // 1. Primary: InnerTubeX (Desktop-style — built-in YouTubeCipherService
-        //    handles n-param deobfuscation internally, no Rhino JS overhead).
-        //    Bounded so a hung cipher/config fetch fails fast into stage 2.
-        //    Media3 validates the URL on open — no blocking probeStream here.
-        val innerTubeXCandidate = try {
-            kotlinx.coroutines.withTimeoutOrNull(INNERTUBEX_STAGE_TIMEOUT_MS) {
-                val visitorData = try {
-                    getWebConfig().visitorData
-                } catch (cancellation: kotlinx.coroutines.CancellationException) {
-                    throw cancellation
-                } catch (_: Exception) {
-                    null
+        // Race both bounded extraction methods. A slow or exhausted direct
+        // path must not hold a ready InnerTubeX URL for another four seconds.
+        val direct = async(Dispatchers.IO) { resolveDirectUrlFastPath(videoId, authScope) }
+        val primary = async(Dispatchers.IO) {
+            val candidate = try {
+                kotlinx.coroutines.withTimeoutOrNull(INNERTUBEX_STAGE_TIMEOUT_MS) {
+                    val visitorData = try {
+                        getWebConfig().visitorData
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) { null }
+                    innerTubeXExtractor.resolve(videoId, visitorData, authScope)
                 }
-                innerTubeXExtractor.resolve(videoId, visitorData, authScope)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                logClientFailure(videoId, "INNERTUBEX", failure)
+                null
             }
-        } catch (cancellation: kotlinx.coroutines.CancellationException) {
-            throw cancellation
-        } catch (failure: Throwable) {
-            logClientFailure(videoId, "INNERTUBEX", failure)
-            null
+            if (candidate != null && !candidate.isAdaptive && !isCompatibleAudioCandidate(candidate)) {
+                logStreamEvent("innertubex-rejected", candidate, detail = "compatible=false")
+                innerTubeXExtractor.reportPlaybackFailure(videoId, authScope, candidate.clientProfile)
+                null
+            } else candidate
         }
-        if (innerTubeXCandidate != null) {
-            val compatible = innerTubeXCandidate.isAdaptive || isCompatibleAudioCandidate(innerTubeXCandidate)
-            // Return URL immediately; player open is the real validation.
-            if (compatible) {
-                cacheResolvedStream(innerTubeXCandidate, now)
-                lastResolvedStreams[resolutionKey(videoId, authScope)] = innerTubeXCandidate
-                logStreamEvent("innertubex-resolved", innerTubeXCandidate)
-                logStage(videoId, "innertubex", startedAt)
-                return@coroutineScope innerTubeXCandidate
-            }
-            logStreamEvent("innertubex-rejected", innerTubeXCandidate, detail = "compatible=$compatible")
-            innerTubeXExtractor.reportPlaybackFailure(
-                videoId = videoId,
-                authScope = authScope,
-                clientProfile = innerTubeXCandidate.clientProfile,
-            )
+        val early = try {
+            com.lastwave.app.playback.firstReadyPlaybackSource(direct, primary, INNERTUBEX_STAGE_TIMEOUT_MS)
+        } finally {
+            direct.cancel()
+            primary.cancel()
+        }
+        early.second?.let { stream ->
+            val method = if (early.first) "innertubex" else "direct-fast"
+            cacheResolvedStream(stream, now)
+            lastResolvedStreams[resolutionKey(videoId, authScope)] = stream
+            logStreamEvent("$method-resolved", stream)
+            logStage(videoId, method, startedAt)
+            return@coroutineScope stream
         }
 
         // 2. Parallel fallback: race direct InnerTube clients vs NewPipe
