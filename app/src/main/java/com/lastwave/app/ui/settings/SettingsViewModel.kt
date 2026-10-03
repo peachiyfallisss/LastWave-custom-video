@@ -122,6 +122,9 @@ class SettingsViewModel @Inject constructor(
         .withSettingsFallback("YouTube sync preference", false)
         .stateIn(viewModelScope, SettingsSharing, false)
     /** History sync defaults ON (see YtMusicPreferences.historySyncEnabled). */
+    val pendingYtHistoryCount: StateFlow<Int> = ytMusicPreferences.pendingHistory.map { it.size }
+        .stateIn(viewModelScope, SettingsSharing, 0)
+
     val ytHistorySyncEnabled: StateFlow<Boolean> = ytMusicPreferences.historySyncEnabled
         .withSettingsFallback("YouTube history sync preference", true)
         .stateIn(viewModelScope, SettingsSharing, true)

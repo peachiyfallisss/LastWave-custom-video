@@ -128,6 +128,11 @@ fun PlaylistScreen(
     val musicPlayer = com.lastwave.app.ui.player.LocalMusicPlayer.current
     val playbackState by musicPlayer.chromeState.collectAsStateWithLifecycle()
     val addToPlaylist = com.lastwave.app.ui.player.LocalAddToPlaylist.current
+    var downloadPlaylistId by remember { mutableStateOf<Long?>(null) }
+    downloadPlaylistId?.let { id ->
+        com.lastwave.app.ui.common.DownloadOptionsDialog(onDismiss = { downloadPlaylistId = null },
+            onDownload = { video -> viewModel.downloadPlaylist(id, video); downloadPlaylistId = null })
+    }
     var coverEditorPlaylistId by remember { mutableStateOf<Long?>(null) }
     var coverPickerPlaylistId by remember { mutableStateOf<Long?>(null) }
     val coverPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -301,7 +306,7 @@ fun PlaylistScreen(
                                     onRename = { viewModel.requestRename(playlist.id) },
                                     onEditCover = { coverEditorPlaylistId = playlist.id },
                                     onTogglePin = { viewModel.togglePinned(playlist.id) },
-                                    onDownload = { viewModel.downloadPlaylist(playlist.id) },
+                                    onDownload = { downloadPlaylistId = playlist.id },
                                     onRegenerate = {
                                         viewModel.regenerate(playlist.id) { newId ->
                                             onOpenPlaylist(newId)

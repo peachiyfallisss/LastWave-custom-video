@@ -143,6 +143,50 @@ class YtMusicPreferences @Inject constructor(
         .recoverPreferences("YtMusicPreferences")
         .map { prefs -> prefs.readSafely(HISTORY_SYNC_ENABLED_KEY) ?: true }
 
+    val pendingHistory: Flow<List<QueuedHistoryListen>> = dataStore.data
+        .recoverPreferences("YtMusicPreferences").map { readHistoryQueue(it) }
+
+    suspend fun enqueueHistory(listen: QueuedHistoryListen): Boolean {
+        var accepted = false
+        dataStore.edit { prefs ->
+            if (historyGate(prefs, listen.accountScope)) {
+                val queue = readHistoryQueue(prefs)
+                if (queue.none { it.id == listen.id }) {
+                    prefs[HISTORY_QUEUE_KEY] = json.encodeToString((queue + listen).sortedBy { it.listenedAtMillis })
+                }
+                accepted = true
+            }
+        }
+        return accepted
+    }
+
+    /** Durably claim before sending: an uncertain network outcome is never replayed. */
+    suspend fun claimHistory(listen: QueuedHistoryListen): Boolean {
+        var claimed = false
+        dataStore.edit { prefs ->
+            val queue = readHistoryQueue(prefs)
+            claimed = historyGate(prefs, listen.accountScope) && queue.any { it.id == listen.id && it.accountScope == listen.accountScope }
+            if (queue.any { it.id == listen.id && it.accountScope == listen.accountScope }) {
+                prefs[HISTORY_QUEUE_KEY] = json.encodeToString(queue.filterNot { it.id == listen.id && it.accountScope == listen.accountScope })
+            }
+        }
+        return claimed
+    }
+
+    private fun readHistoryQueue(prefs: Preferences): List<QueuedHistoryListen> =
+        prefs.readSafely(HISTORY_QUEUE_KEY)?.let {
+            runCatching { json.decodeFromString<List<QueuedHistoryListen>>(it) }.getOrNull()
+        }.orEmpty()
+
+    private fun historyGate(prefs: Preferences, scope: String): Boolean =
+        (prefs.readSafely(HISTORY_SYNC_ENABLED_KEY) ?: true) &&
+            !prefs.readSafely(COOKIES_KEY).isNullOrBlank() &&
+            QueuedHistoryListen.scope(
+                prefs.readSafely(ACCOUNT_NAME_KEY).orEmpty(), prefs.safeLong(CONNECTED_AT_KEY),
+                prefs.readSafely(ON_BEHALF_OF_USER_KEY), prefs.readSafely(AUTH_USER_INDEX_KEY),
+                prefs.readSafely(PAGE_ID_KEY).orEmpty(),
+            ) == scope
+
     val lastSyncAt: Flow<Long> = dataStore.data
         .recoverPreferences("YtMusicPreferences")
         .map { it.safeLong(LAST_SYNC_KEY) }
@@ -242,13 +286,25 @@ class YtMusicPreferences @Inject constructor(
         onBehalfOfUser: String? = null,
         authUserIndex: Int? = null,
         pageId: String = "",
+        newSession: Boolean = false,
     ) {
         dataStore.edit { prefs ->
+            val oldEpoch = prefs.safeLong(CONNECTED_AT_KEY)
+            val oldScope = QueuedHistoryListen.scope(prefs.readSafely(ACCOUNT_NAME_KEY).orEmpty(), oldEpoch,
+                prefs.readSafely(ON_BEHALF_OF_USER_KEY), prefs.readSafely(AUTH_USER_INDEX_KEY), prefs.readSafely(PAGE_ID_KEY).orEmpty())
+            val sameChannel = prefs.readSafely(ON_BEHALF_OF_USER_KEY).orEmpty() == onBehalfOfUser.orEmpty() &&
+                prefs.readSafely(AUTH_USER_INDEX_KEY) == authUserIndex && prefs.readSafely(PAGE_ID_KEY).orEmpty() == pageId
+            val keepSession = !newSession && oldEpoch > 0 && !prefs.readSafely(COOKIES_KEY).isNullOrBlank() && sameChannel
+            val epoch = if (keepSession) oldEpoch else maxOf(System.currentTimeMillis(), oldEpoch + 1)
+            val queue = readHistoryQueue(prefs)
+            val newScope = QueuedHistoryListen.scope(accountName, epoch, onBehalfOfUser, authUserIndex, pageId)
+            prefs[HISTORY_QUEUE_KEY] = json.encodeToString(if (keepSession) queue.filter { it.accountScope == oldScope }
+                .map { it.copy(accountScope = newScope) } else emptyList())
             prefs[COOKIES_KEY] = json.encodeToString(cookies)
             prefs[ACCOUNT_NAME_KEY] = accountName
             if (channelHandle != null) prefs[CHANNEL_HANDLE_KEY] = channelHandle else prefs.remove(CHANNEL_HANDLE_KEY)
             if (photoUrl != null) prefs[PHOTO_URL_KEY] = photoUrl else prefs.remove(PHOTO_URL_KEY)
-            prefs[CONNECTED_AT_KEY] = System.currentTimeMillis()
+            prefs[CONNECTED_AT_KEY] = epoch
             // A newly connected account is live by default; no separate auto-sync setup step.
             prefs[SYNC_ENABLED_KEY] = true
             // A fresh login starts on YouTube's default channel; an explicit
@@ -265,6 +321,7 @@ class YtMusicPreferences @Inject constructor(
     /** Switches the active YouTube channel inside the current session. */
     suspend fun setSelectedChannel(onBehalfOfUser: String?, authUserIndex: Int?, pageId: String = "") {
         dataStore.edit { prefs ->
+            prefs.remove(HISTORY_QUEUE_KEY)
             if (onBehalfOfUser.isNullOrBlank()) prefs.remove(ON_BEHALF_OF_USER_KEY)
             else prefs[ON_BEHALF_OF_USER_KEY] = onBehalfOfUser
             if (authUserIndex == null) prefs.remove(AUTH_USER_INDEX_KEY)
@@ -288,6 +345,7 @@ class YtMusicPreferences @Inject constructor(
         pageId: String = "",
     ) {
         dataStore.edit { prefs ->
+            prefs.remove(HISTORY_QUEUE_KEY)
             if (onBehalfOfUser.isNullOrBlank()) prefs.remove(ON_BEHALF_OF_USER_KEY)
             else prefs[ON_BEHALF_OF_USER_KEY] = onBehalfOfUser
             if (authUserIndex == null) prefs.remove(AUTH_USER_INDEX_KEY)
@@ -302,6 +360,7 @@ class YtMusicPreferences @Inject constructor(
 
     suspend fun clearConnection() {
         dataStore.edit { prefs ->
+            prefs.remove(HISTORY_QUEUE_KEY)
             prefs.remove(COOKIES_KEY)
             prefs.remove(ACCOUNT_NAME_KEY)
             prefs.remove(CHANNEL_HANDLE_KEY)
@@ -383,7 +442,10 @@ class YtMusicPreferences @Inject constructor(
     }
 
     suspend fun setHistorySyncEnabled(enabled: Boolean) {
-        dataStore.edit { it[HISTORY_SYNC_ENABLED_KEY] = enabled }
+        dataStore.edit {
+            it[HISTORY_SYNC_ENABLED_KEY] = enabled
+            if (!enabled) it.remove(HISTORY_QUEUE_KEY)
+        }
     }
 
     suspend fun lastSyncAtMillis(): Long =
@@ -429,6 +491,7 @@ class YtMusicPreferences @Inject constructor(
         val PHOTO_URL_KEY = stringPreferencesKey("ytm_photo_url")
         val CONNECTED_AT_KEY = longPreferencesKey("ytm_connected_at")
         val SYNC_ENABLED_KEY = booleanPreferencesKey("ytm_sync_enabled")
+        val HISTORY_QUEUE_KEY = stringPreferencesKey("ytm_pending_history")
         val HISTORY_SYNC_ENABLED_KEY = booleanPreferencesKey("ytm_history_sync_enabled")
         val SYNCED_PLAYLIST_IDS_KEY = stringPreferencesKey("ytm_synced_playlist_ids")
         val MAPPINGS_KEY = stringPreferencesKey("ytm_playlist_mappings")

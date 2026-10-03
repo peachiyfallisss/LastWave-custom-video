@@ -172,6 +172,7 @@ class DownloadMenuViewModel @Inject constructor(
         artworkUrl: String? = null,
         videoId: String? = null,
         durationMs: Long? = null,
+        includeVideo: Boolean = false,
     ) {
         downloadManager.downloadTrack(
             title = title,
@@ -180,6 +181,7 @@ class DownloadMenuViewModel @Inject constructor(
             artworkUrl = artworkUrl,
             videoId = videoId,
             durationMs = durationMs,
+            includeVideo = includeVideo,
         )
         routeNavigator.navigateTo(com.lastwave.app.ui.navigation.Screen.Downloads.route)
     }
@@ -310,6 +312,7 @@ fun TrackContextMenuSheet(
     val activeDownloads by downloadViewModel.activeDownloads.collectAsStateWithLifecycle()
     val downloadQuality by downloadViewModel.downloadQuality.collectAsStateWithLifecycle()
     val downloadLabel = remember(downloadQuality) { downloadLabelForQuality(downloadQuality) }
+    var pendingDownload by remember(target) { mutableStateOf<com.lastwave.app.playback.PlayableTrack?>(null) }
     var isDownloaded by remember(target) { mutableStateOf(false) }
 
     LaunchedEffect(target, activeDownloads) {
@@ -331,6 +334,15 @@ fun TrackContextMenuSheet(
     fun exploreGenre(genre: String) {
         if (onExploreGenre != null) onExploreGenre(genre)
         else exploreGenreViewModel.explore(genre)
+    }
+
+    pendingDownload?.let { track ->
+        DownloadOptionsDialog(onDismiss = { pendingDownload = null }, onDownload = { includeVideo ->
+            downloadViewModel.download(track.title, track.artist, track.album, track.artworkUrl,
+                track.videoId, track.durationMs, includeVideo)
+            pendingDownload = null
+            onDismiss()
+        })
     }
 
     if (showDetailsSheet && target is TrackMenuTarget.Track) {
@@ -524,13 +536,8 @@ fun TrackContextMenuSheet(
                     add { pos ->
                         when {
                             isDownloaded -> {
-                                MenuActionRow(Icons.Filled.CheckCircle, "Downloaded", position = pos) {
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "Track is already downloaded",
-                                        android.widget.Toast.LENGTH_SHORT,
-                                    ).show()
-                                    onDismiss()
+                                MenuActionRow(Icons.Filled.CheckCircle, "Downloaded • options", position = pos) {
+                                    pendingDownload = playable
                                 }
                             }
                             isDownloading -> {
@@ -545,15 +552,7 @@ fun TrackContextMenuSheet(
                             }
                             else -> {
                                 MenuActionRow(Icons.Filled.Download, downloadLabel, position = pos) {
-                                    downloadViewModel.download(
-                                        title = t.name,
-                                        artist = t.artist,
-                                        album = playable.album,
-                                        artworkUrl = playable.artworkUrl,
-                                        videoId = playable.videoId,
-                                        durationMs = playable.durationMs,
-                                    )
-                                    onDismiss()
+                                    pendingDownload = playable
                                 }
                             }
                         }

@@ -84,7 +84,7 @@ class YtMusicAuthManager @Inject constructor(
             channelHandle = channelHandle,
             photoUrl = photoUrl,
         )
-        preferences.saveConnection(cookies, name, channelHandle, photoUrl)
+        preferences.saveConnection(cookies, name, channelHandle, photoUrl, newSession = true)
     }
 
     suspend fun updateAccountIdentity(accountName: String, channelHandle: String?, photoUrl: String?) {

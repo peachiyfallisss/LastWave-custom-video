@@ -165,6 +165,11 @@ fun PlaylistDetailScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    var showDownloadOptions by remember(playlistId) { mutableStateOf(false) }
+    if (showDownloadOptions) {
+        com.lastwave.app.ui.common.DownloadOptionsDialog(onDismiss = { showDownloadOptions = false },
+            onDownload = { video -> viewModel.downloadPlaylist(playlistId, video); showDownloadOptions = false })
+    }
     val haptic = LocalHapticFeedback.current
     val musicPlayer = com.lastwave.app.ui.player.LocalMusicPlayer.current
     val playbackState by musicPlayer.chromeState.collectAsStateWithLifecycle()
@@ -1019,7 +1024,7 @@ fun PlaylistDetailScreen(
                                 leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
                                 onClick = {
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    viewModel.downloadPlaylist(playlistId)
+                                    showDownloadOptions = true
                                     overflowMenuOpen = false
                                 },
                             )

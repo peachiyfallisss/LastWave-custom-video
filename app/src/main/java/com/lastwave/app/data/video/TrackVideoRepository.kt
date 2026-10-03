@@ -7,6 +7,16 @@ import com.lastwave.app.playback.MusicPlayer
 import com.lastwave.app.playback.PlayableTrack
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.IOException
+import java.io.File
+import java.util.UUID
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Response
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -22,7 +32,7 @@ import org.json.JSONObject
 /** Store stable page/document URIs; signed CDN URLs are resolved ahead of playback and refreshed when needed. */
 @Singleton
 class TrackVideoRepository @Inject constructor(
-    @ApplicationContext context: Context,
+    @ApplicationContext private val context: Context,
     private val youtube: YouTubeStreamExtractor,
     http: OkHttpClient,
 ) {
@@ -30,24 +40,174 @@ class TrackVideoRepository @Inject constructor(
     private val preferences = context.getSharedPreferences("lastwave_track_videos", Context.MODE_PRIVATE)
     private val client = http.newBuilder().callTimeout(20, TimeUnit.SECONDS).build()
 
-    fun sourceFor(track: PlayableTrack): String? = preferences.getString(key(track), null)
-        ?: track.videoId?.let { "https://www.youtube.com/watch?v=$it" }
+    private val offlineRoot = File(context.filesDir, "offline-videos")
+    private val downloadClient = http.newBuilder().callTimeout(30, TimeUnit.MINUTES)
+        .readTimeout(30, TimeUnit.SECONDS).build()
 
-    fun customSourceFor(track: PlayableTrack): String? = preferences.getString(key(track), null)
+    private fun identityKey(track: PlayableTrack): String = preferences.getString("alias:${key(track)}", null) ?: key(track)
+    private fun selectedSource(track: PlayableTrack): String? = customSourceFor(track)
+        ?: track.videoId?.let { "https://www.youtube.com/watch?v=$it" }
+        ?: preferences.getString("original:${identityKey(track)}", null)
+        ?: offlineManifest(identityKey(track))?.optString("source")
+
+    fun sourceFor(track: PlayableTrack): String? {
+        val source = selectedSource(track)
+        val saved = offlineManifest(identityKey(track))?.takeIf { it.optString("source") == source }
+        return saved?.let { Uri.fromFile(File(it.getString("video"))).toString() } ?: source
+    }
+
+    fun hasOfflineVideo(track: PlayableTrack): Boolean =
+        offlineManifest(identityKey(track))?.optString("source") == selectedSource(track) &&
+            offlineManifest(identityKey(track)) != null
+
+    fun customSourceFor(track: PlayableTrack): String? = preferences.getString(identityKey(track), null)
+
+    private fun offlineManifest(identity: String): JSONObject? = runCatching {
+        val raw = preferences.getString("offline:$identity", null) ?: return@runCatching null
+        JSONObject(raw).takeIf { saved ->
+            listOf(saved.getString("video"), saved.optString("audio")).filter { it.isNotBlank() }
+                .all { File(it).let { file -> file.isFile && file.length() > 0 && file.canonicalPath.startsWith(offlineRoot.canonicalPath + "/") } }
+        }
+    }.getOrNull()
+
+    /** Save the selected rendition, including its separate soundtrack when adaptive. */
+    suspend fun downloadVideo(track: PlayableTrack, audioPaths: List<String>, fallbackVideoId: String? = null, onProgress: (Int) -> Unit) = withContext(Dispatchers.IO) {
+        val identity = identityKey(track)
+        if (!hasOfflineVideo(track)) {
+            val source = selectedSource(track) ?: fallbackVideoId?.let { "https://www.youtube.com/watch?v=$it" } ?: throw IOException("No video is selected for this song.")
+            val resolved = resolve(source)
+            if (resolved.mimeType.contains("mpegurl", true) || resolved.mimeType.contains("dash", true)) {
+                throw IOException("Offline video needs a YouTube, Bilibili, MP4/WebM, or device video; manifest links are playback only.")
+            }
+            val folder = File(offlineRoot, UUID.randomUUID().toString()).apply {
+                if (!mkdirs()) throw IOException("Cannot create offline video folder.")
+            }
+            try {
+                val video = File(folder, "video")
+                copyMedia(resolved, video) { percent -> onProgress(if (resolved.companionAudio == null) percent else percent * 9 / 10) }
+                val audio = resolved.companionAudio?.let { part ->
+                    File(folder, "audio").also { copyMedia(part, it) { percent -> onProgress(90 + percent / 10) } }
+                }
+                currentCoroutineContext().ensureActive()
+                // Atomic publication: incomplete pairs are never visible to playback.
+                val saved = JSONObject().put("source", source).put("video", video.absolutePath)
+                    .put("mime", resolved.mimeType).put("duration", resolved.durationMs ?: 0L)
+                    .put("audio", audio?.absolutePath.orEmpty()).put("audioMime", resolved.companionAudio?.mimeType.orEmpty())
+                File(folder, "manifest.json").writeText(saved.toString())
+                val old = offlineManifest(identity)
+                if (!preferences.edit().putString("offline:$identity", saved.toString()).commit()) throw IOException("Cannot save offline video.")
+                old?.let { File(it.getString("video")).parentFile?.deleteRecursively() }
+            } catch (failure: Throwable) {
+                folder.deleteRecursively()
+                throw failure
+            }
+        }
+        preferences.edit().apply {
+            (track.videoId ?: fallbackVideoId)?.let { putString("original:$identity", "https://www.youtube.com/watch?v=$it") }
+            audioPaths.filter { it.isNotBlank() }.forEach { path ->
+                putString("alias:${key(track.copy(videoId = null, playbackUrl = path))}", identity)
+                if (path.startsWith("/")) putString("alias:${key(track.copy(videoId = null, playbackUrl = Uri.fromFile(File(path)).toString()))}", identity)
+            }
+        }.commit()
+    }
+
+    private suspend fun copyMedia(part: MusicPlayer.ResolvedStream, destination: File, progress: (Int) -> Unit) {
+        val uri = Uri.parse(part.url)
+        if (uri.scheme == "content" || uri.scheme == "file") {
+            val input = if (uri.scheme == "content") contentResolver.openInputStream(uri) else File(uri.path!!).inputStream()
+            (input ?: throw IOException("Cannot read device video.")).use { source ->
+                destination.outputStream().use { out ->
+                    val buffer = ByteArray(128 * 1024)
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val size = source.read(buffer)
+                        if (size < 0) break
+                        out.write(buffer, 0, size)
+                    }
+                }
+            }
+            if (destination.length() == 0L) throw IOException("Empty video.")
+            progress(100)
+            return
+        }
+        suspendCancellableCoroutine<Unit> { continuation ->
+            val request = Request.Builder().url(part.url).apply { part.requestHeaders.forEach { (key, value) -> header(key, value) } }.build()
+            val call = downloadClient.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (continuation.isActive) continuation.resumeWithException(e)
+                }
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use {
+                            if (!it.isSuccessful) throw IOException("Video download failed (HTTP ${it.code}).")
+                            val body = it.body ?: throw IOException("Empty video response.")
+                            val expected = body.contentLength()
+                            var count = 0L
+                            body.byteStream().use { input -> destination.outputStream().use { out ->
+                                val buffer = ByteArray(128 * 1024)
+                                while (continuation.isActive) {
+                                    val size = input.read(buffer)
+                                    if (size < 0) break
+                                    out.write(buffer, 0, size)
+                                    count += size
+                                    if (expected > 0) progress((count * 100 / expected).toInt().coerceIn(0, 100))
+                                }
+                            } }
+                            if (continuation.isActive && (count == 0L || (expected > 0 && count != expected))) throw IOException("Video download incomplete.")
+                        }
+                        if (continuation.isActive) continuation.resume(Unit)
+                    } catch (failure: Exception) {
+                        if (continuation.isActive) continuation.resumeWithException(failure)
+                    }
+                }
+            })
+        }
+    }
+
+    fun deleteOfflineVideo(audioPath: String) {
+        val alias = "alias:${key(PlayableTrack("", "", playbackUrl = audioPath))}"
+        val identity = preferences.getString(alias, null) ?: return
+        offlineManifest(identity)?.let { File(it.getString("video")).parentFile?.deleteRecursively() }
+        preferences.edit().apply {
+            remove("offline:$identity")
+            preferences.all.filter { it.key.startsWith("alias:") && it.value == identity }.forEach { remove(it.key) }
+        }.commit()
+    }
+
+    fun clearOfflineVideos() {
+        offlineRoot.deleteRecursively()
+        preferences.edit().apply {
+            preferences.all.keys.filter { it.startsWith("offline:") || it.startsWith("alias:") }.forEach { remove(it) }
+        }.commit()
+    }
 
     fun save(track: PlayableTrack, source: String) {
         val uri = Uri.parse(source.trim())
         require(uri.scheme == "content" || uri.scheme == "https") {
             "Choose a video from your device or an HTTPS video link."
         }
-        preferences.edit().putString(key(track), source.trim()).apply()
+        preferences.edit().putString(identityKey(track), source.trim()).apply()
     }
 
-    fun remove(track: PlayableTrack) { preferences.edit().remove(key(track)).apply() }
+    fun remove(track: PlayableTrack) { preferences.edit().remove(identityKey(track)).apply() }
 
     suspend fun resolve(source: String): MusicPlayer.ResolvedStream = withContext(Dispatchers.IO) {
         val uri = Uri.parse(source)
         val cacheKey = "video:$source:${System.nanoTime()}"
+        if (uri.scheme == "file") {
+            val file = File(uri.path ?: throw IOException("Invalid offline video."))
+            require(file.canonicalPath.startsWith(offlineRoot.canonicalPath + "/")) { "Invalid offline video path." }
+            val saved = JSONObject(File(file.parentFile, "manifest.json").readText())
+            val audio = saved.optString("audio").takeIf { it.isNotBlank() }?.let {
+                val soundtrack = File(it)
+                require(soundtrack.canonicalPath.startsWith(offlineRoot.canonicalPath + "/") && soundtrack.isFile) { "Offline soundtrack missing." }
+                stream(Uri.fromFile(soundtrack).toString(), saved.getString("audioMime"), "$cacheKey:audio")
+            }
+            return@withContext stream(source, saved.getString("mime"), cacheKey, duration = saved.optLong("duration").takeIf { it > 0 })
+                .copy(companionAudio = audio)
+        }
         if (uri.scheme == "content") return@withContext stream(source, contentResolver.getType(uri) ?: "video/mp4", cacheKey)
         val url = source.toHttpUrlOrNull() ?: throw IOException("Invalid video link")
         require(url.scheme == "https") { "Video links must use HTTPS." }

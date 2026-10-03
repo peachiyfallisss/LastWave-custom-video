@@ -78,3 +78,13 @@ For a repository you own containing this source, open Actions → Build custom L
 - Choose a local file, restart the app, and reopen it. Remove the video and confirm normal audio playback.
 - Test YouTube, a public Bilibili link, a `p=2` Bilibili link, a short link, a failed link, repeat-one, repeat-all, shuffle, and skipping while a source is opening.
 - Enable history sync with your connected YouTube account, listen past the normal threshold, and check that the original song appears once. Check actual badges separately.
+
+
+## 4.2.2-custom-video.6
+
+- Persist qualified offline listens and automatically submit them through network-constrained WorkManager jobs after reconnecting, including after app restarts. Pending count appears in YouTube history settings. Original listening timestamps are kept locally; YouTube's history endpoint accepts no original timestamp, so late entries can appear at sync time. Badge credit remains determined by YouTube.
+- Clear queued listens on disconnect, a new login, channel switch, or disabling history sync. Cookie/display refresh within the same session preserves the queue. Claim each listen before submission so an uncertain network outcome is not replayed.
+- Add Audio only / Audio + video choices to song downloads and both playlist bulk-download menus. Save the currently selected rendition with its own adaptive soundtrack; use local files in video mode, including from Downloads. Add video to an existing verified audio download without downloading its audio again. A video failure leaves completed audio intact.
+- Progressive YouTube/Bilibili streams, direct MP4/WebM links, and device video files can be saved. Custom HLS/DASH manifest links remain playback-only and report a clear download error.
+- Start interactive playback from the first usable YouTube/lossless stream instead of holding ready YouTube audio for the lossless lookup. Continue eligible quality upgrades in the background. Reduce initial playback buffering from 1.5s to 0.5s; keep rebuffer protection unchanged.
+- Add persistence/account-isolation tests, exact video/soundtrack and partial-transfer tests, and controlled-time startup race tests. Android playback timing and offline behavior still require verification on a real device.

@@ -1169,7 +1169,7 @@ class MusicPlayer @Inject constructor(
             .setBufferDurationsMs(
                 /* minBufferMs = */ if (handleAudioFocus) 45_000 else 15_000,
                 /* maxBufferMs = */ if (handleAudioFocus) 120_000 else 30_000,
-                /* bufferForPlaybackMs = */ 1_500,
+                /* bufferForPlaybackMs = */ 500,
                 /* bufferForPlaybackAfterRebufferMs = */ 2_500,
             )
             .setPrioritizeTimeOverSizeThresholds(true)
@@ -5584,18 +5584,16 @@ class MusicPlayer @Inject constructor(
                     if (!videoId.isNullOrBlank()) 3_500L else 4_500L
                 }
                 val losslessBudgetMs = (losslessTimeoutMs - (SystemClock.elapsedRealtime() - forkStart)).coerceAtLeast(0L)
-                // Unbounded skips the deadline entirely rather than passing
-                // Long.MAX_VALUE to withTimeoutOrNull, whose deadline
-                // computation would overflow.
-                val losslessStream: ResolvedStream? = if (losslessDeferred.isCompleted) {
-                    runCatching { losslessDeferred.await() }.getOrNull()
-                } else if (losslessBudget == LosslessBudget.Unbounded) {
-                    runCatching { losslessDeferred.await() }.getOrNull()
-                } else if (losslessBudgetMs <= 0L) {
-                    null
+                // Interactive playback takes the first usable source. Quality
+                // discovery continues without holding a ready YouTube stream.
+                var firstYoutubeStream: ResolvedStream? = null
+                val losslessStream: ResolvedStream? = if (losslessBudget == LosslessBudget.Unbounded) {
+                    losslessDeferred.await()
                 } else {
-                    withTimeoutOrNull(losslessBudgetMs) {
-                        runCatching { losslessDeferred.await() }.getOrNull()
+                    val first = firstReadyPlaybackSource(youtubeDeferred, losslessDeferred, losslessBudgetMs)
+                    if (first.first) first.second else {
+                        firstYoutubeStream = first.second
+                        null
                     }
                 }
 
@@ -5607,11 +5605,11 @@ class MusicPlayer @Inject constructor(
                     )
                     losslessStream
                 } else {
-                    if (!losslessDeferred.isCompleted) {
+                    if (firstYoutubeStream != null || !losslessDeferred.isCompleted) {
                         activeUpgradeDeferred?.cancel()
                         activeUpgradeDeferred = losslessDeferred
                     }
-                    val ytStream = youtubeDeferred.await()
+                    val ytStream = firstYoutubeStream ?: youtubeDeferred.await()
                         ?: runCatching { resolveYoutubeTrackAudioStream(track, videoId) }.getOrNull()
                         ?: resolveYoutubeTrackAudioStream(track, null)
                     android.util.Log.i(

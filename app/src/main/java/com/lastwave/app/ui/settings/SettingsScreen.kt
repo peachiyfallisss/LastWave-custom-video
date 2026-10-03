@@ -438,6 +438,7 @@ fun SettingsScreen(
     val downloadTotalBytes by viewModel.downloadTotalBytes.collectAsStateWithLifecycle()
     val ytConnection by viewModel.ytConnection.collectAsStateWithLifecycle()
     val ytSyncEnabled by viewModel.ytSyncEnabled.collectAsStateWithLifecycle()
+    val pendingYtHistoryCount by viewModel.pendingYtHistoryCount.collectAsStateWithLifecycle()
     val ytHistorySyncEnabled by viewModel.ytHistorySyncEnabled.collectAsStateWithLifecycle()
     val ytSyncState by viewModel.ytSyncState.collectAsStateWithLifecycle()
     val ytLastSyncAt by viewModel.ytLastSyncAt.collectAsStateWithLifecycle()
@@ -1464,7 +1465,7 @@ fun SettingsScreen(
                                     iconTint = MaterialTheme.colorScheme.onTertiaryContainer,
                                     title = stringResource(R.string.settings_yt_history),
                                     subtitle = if (ytHistorySyncEnabled) {
-                                        "On • songs you listen to in LastWave, including lossless & downloads, appear in your YouTube Music history"
+                                        "On • offline listens sync when connected ($pendingYtHistoryCount pending). YouTube may show them at sync time."
                                     } else {
                                         "Off • listening in LastWave stays out of your YouTube Music history"
                                     },

@@ -61,7 +61,7 @@ android {
         applicationId = "com.lastwave.app"
         minSdk = (project.findProperty("minSdk") as? String)?.toIntOrNull() ?: 29
         targetSdk = 35
-        versionCode = 24
+        versionCode = 25
         versionName = "4.2.2"
 
         // Native secrets (addon client lock) live strictly in native .so via
@@ -140,7 +140,7 @@ android {
         debug {
             isDebuggable = true
             applicationIdSuffix = ".custom"
-            versionNameSuffix = "-custom-video.5"
+            versionNameSuffix = "-custom-video.6"
         }
     }
 
@@ -236,6 +236,7 @@ dependencies {
     ksp(libs.room.compiler)
 
     implementation(libs.datastore.preferences)
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
     implementation(libs.coil.compose)
     implementation(libs.lyrics.ui)
     implementation(libs.lyrics.core)

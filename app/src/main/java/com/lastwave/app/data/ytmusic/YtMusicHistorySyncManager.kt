@@ -1,5 +1,9 @@
 package com.lastwave.app.data.ytmusic
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import dagger.hilt.android.qualifiers.ApplicationContext
 import android.os.SystemClock
 import android.util.Log
 import com.lastwave.app.data.music.InnerTubeMusicApi
@@ -7,22 +11,20 @@ import com.lastwave.app.data.music.YouTubeMusicTrack
 import com.lastwave.app.playback.MusicPlayer
 import com.lastwave.app.playback.MusicPlayerState
 import java.io.IOException
-import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.abs
-import kotlin.random.Random
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * Reports songs genuinely listened to in LastWave to the connected YouTube
@@ -56,12 +58,10 @@ import kotlinx.coroutines.withContext
  *   longer equals it — one account's listens are never written to another.
  * - Disabling the switch or disconnecting/switching accounts cancels
  *   in-flight work immediately.
- * - Retries are bounded (3 attempts, backoff) and account-scoped. Timeouts
- *   are treated as UNCERTAIN and never retried (the ping may have landed).
- *   There is no persistent offline queue: the endpoint accepts no timestamp,
- *   so a late replay would misattribute the listen time. Transient blips are
- *   covered by the in-memory retry; longer outages are dropped, never
- *   backfilled, never reordered.
+ * - Qualified listens are stored durably and sent when connectivity returns,
+ *   including after process restarts. No credentials are stored in the queue.
+ *   YouTube accepts no original timestamp: late listens may show at sync time.
+ *   Uncertain submission outcomes are not replayed, to avoid duplicates.
  * - Nothing sensitive is logged: no cookies, auth headers, or tracking URLs —
  *   only videoIds and status codes.
  *
@@ -72,13 +72,15 @@ import kotlinx.coroutines.withContext
  */
 @Singleton
 class YtMusicHistorySyncManager @Inject constructor(
-    private val musicPlayer: MusicPlayer,
+    @ApplicationContext private val context: Context,
+    private val musicPlayer: dagger.Lazy<MusicPlayer>,
     private val innerTube: InnerTubeMusicApi,
     private val ytAuth: YtMusicAuthManager,
     private val preferences: YtMusicPreferences,
     private val applicationScope: CoroutineScope,
 ) {
     @Volatile private var started = false
+    private val flushMutex = Mutex()
 
     // ── Session accounting (single-threaded: only mutated from the state collector) ──
     private var sessionKey: String? = null
@@ -101,8 +103,11 @@ class YtMusicHistorySyncManager @Inject constructor(
     fun start() {
         if (started) return
         started = true
+        applicationScope.launch(Dispatchers.IO) {
+            if (preferences.pendingHistory.first().isNotEmpty()) YtHistorySyncWorker.schedule(context)
+        }
         applicationScope.launch(Dispatchers.Main.immediate) {
-            combine(musicPlayer.state, ytAuth.connection, preferences.historySyncEnabled) { state, account, enabled ->
+            combine(musicPlayer.get().state, ytAuth.connection, preferences.historySyncEnabled) { state, account, enabled ->
                 Triple(state, account, enabled)
             }.collect { (state, account, enabled) ->
                 if (account != activeAccount || enabled != historyEnabled) {
@@ -159,27 +164,28 @@ class YtMusicHistorySyncManager @Inject constructor(
         submittedSessionId = sessionId
         Log.d(TAG, "Listen qualified after ${listenedMs / 1000}s; preparing history submission")
         launchSubmit(
-            PendingListen(
+            QueuedHistoryListen(
                 title = track.title,
                 artist = track.artist,
                 album = track.album,
-                videoId = track.videoId,
+                videoId = track.videoId ?: track.playbackUrl?.let {
+                    context.getSharedPreferences("lastwave_download_sources", Context.MODE_PRIVATE).getString(it, null)
+                },
                 // An attached video may include an intro/outro; catalog matching uses the original song duration.
                 durationMs = track.durationMs?.takeIf { it > 0L } ?: s.durationMs,
-                account = activeAccount,
-                sessionId = sessionId,
+                accountScope = QueuedHistoryListen.scope(activeAccount),
             ),
         )
     }
 
-    private fun launchSubmit(pending: PendingListen) {
+    private fun launchSubmit(pending: QueuedHistoryListen) {
         val job = applicationScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             try {
-                submitWithRetry(pending)
+                if (preferences.enqueueHistory(pending)) YtHistorySyncWorker.schedule(context)
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (e: Exception) {
-                Log.w(TAG, "History sync failed for session ${pending.sessionId}: ${e.javaClass.simpleName}")
+                Log.w(TAG, "History sync failed for session ${pending.id}: ${e.javaClass.simpleName}")
             }
         }
         activeSubmissions.add(job)
@@ -193,96 +199,50 @@ class YtMusicHistorySyncManager @Inject constructor(
         activeSubmissions.forEach { it.cancel() }
     }
 
-    private suspend fun submitWithRetry(pending: PendingListen) {
-        if (!preferences.historySyncEnabled.first()) {
-            Log.d(TAG, "History sync off; dropping ${pending.sessionId}")
-            return
+    /** Returns false for deferred work; WorkManager retries when the network is available. */
+    suspend fun flushPendingHistory(): Boolean = flushMutex.withLock {
+        val network = context.getSystemService(ConnectivityManager::class.java)
+        val capabilities = network?.getNetworkCapabilities(network.activeNetwork)
+        if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) != true) {
+            return@withLock preferences.pendingHistory.first().isEmpty()
         }
-        if (!pending.account.isConnected || ytAuth.connection.value != pending.account) {
-            Log.d(TAG, "Account changed/disconnected; dropping ${pending.sessionId}")
-            return
-        }
-        if (pending.title.isBlank()) {
-            Log.d(TAG, "Blank title; skipping ${pending.sessionId}")
-            return
-        }
-        val videoId = pending.videoId?.takeIf { VIDEO_ID.matches(it) }
-            ?: resolveStrictVideoId(pending)?.also {
-                Log.d(TAG, "Strict match for '${pending.title}' -> $it")
-            }
-        if (videoId == null) {
-            Log.d(TAG, "No strict YT match for '${pending.title}' by '${pending.artist}'; skipping")
-            return
-        }
-
-        val cpn = newCpn()
-        var trackingUrl: String? = null
-        var attempt = 0
-        while (attempt < MAX_SUBMIT_ATTEMPTS) {
-            attempt++
-            // Re-gate every attempt: never write to a different account than
-            // the one that was connected when this listen qualified.
-            if (!preferences.historySyncEnabled.first() ||
-                !pending.account.isConnected ||
-                ytAuth.connection.value != pending.account
+        for (pending in preferences.pendingHistory.first().sortedBy { it.listenedAtMillis }) {
+            val account = ytAuth.awaitLoadedConnection()
+            if (!preferences.historySyncEnabled.first() || !account.isConnected ||
+                QueuedHistoryListen.scope(account) != pending.accountScope
             ) {
-                Log.d(TAG, "Gate closed mid-retry; dropping ${pending.sessionId}")
-                return
+                preferences.claimHistory(pending) // Discard an obsolete account's item; never submit it.
+                continue
             }
             try {
-                // One player lookup per session; the tracking URL is reused
-                // across retries instead of re-fetching every attempt.
-                val baseUrl = trackingUrl
-                    ?: withContext(Dispatchers.IO) { innerTube.fetchHistoryTrackingUrl(videoId, pending.account) }
-                    ?: throw IOException("No history tracking URL for $videoId")
-                trackingUrl = baseUrl
-                if (!preferences.historySyncEnabled.first() || ytAuth.connection.value != pending.account) return
-                val code = innerTube.submitHistoryPlayback(baseUrl, cpn, pending.account)
-                when {
-                    code in 200..299 -> {
-                        Log.d(TAG, "History ping accepted for $videoId (HTTP $code); remote visibility not verified")
-                        return
-                    }
-                    code == 401 || code == 403 -> {
-                        // Stale/revoked credentials. Drop without retry and
-                        // without touching playback; the user can reconnect.
-                        Log.w(TAG, "History auth failure (HTTP $code); dropping $videoId")
-                        return
-                    }
-                    code == 408 || code == 429 || code in 500..599 -> {
-                        Log.w(TAG, "History transient HTTP $code for $videoId (attempt $attempt)")
-                    }
-                    else -> {
-                        Log.w(TAG, "History permanent HTTP $code for $videoId; dropping")
-                        return
-                    }
+                val videoId = pending.videoId?.takeIf { VIDEO_ID.matches(it) } ?: resolveStrictVideoId(pending)
+                if (videoId == null || pending.title.isBlank()) {
+                    preferences.claimHistory(pending)
+                    continue
                 }
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (_: SocketTimeoutException) {
-                // Uncertain: the ping may have reached YouTube. Retrying
-                // could double-register history, so drop it instead.
-                Log.w(TAG, "History ping timed out for $videoId; not retrying (uncertain outcome)")
-                return
-            } catch (e: InnerTubeMusicApi.InnerTubeHttpException) {
-                // post()-level failures from the player lookup.
-                if (e.responseCode == 401 || e.responseCode == 403) {
-                    Log.w(TAG, "History player auth failure (HTTP ${e.responseCode}); dropping $videoId")
-                    return
+                // Resolve fresh authenticated tracking data only once online.
+                val tracking = innerTube.fetchHistoryTrackingUrl(videoId, account)
+                    ?: return@withLock false
+                // Final atomic privacy gate plus durable claim, before any network write.
+                if (!preferences.claimHistory(pending)) continue
+                val code = innerTube.submitHistoryPlayback(tracking, pending.id.replace("-", "").take(CPN_LENGTH), account)
+                if (code == 408 || code == 429 || code in 500..599) {
+                    preferences.enqueueHistory(pending) // Explicit failure: safe to retry the same listen.
+                    return@withLock false
                 }
-                Log.w(TAG, "History player HTTP ${e.responseCode} for $videoId (attempt $attempt)")
-            } catch (e: IOException) {
-                if (trackingUrl != null) {
-                    Log.w(TAG, "History transport outcome uncertain for $videoId; not retrying")
-                    return
-                }
-                Log.w(TAG, "History lookup failed for $videoId (attempt $attempt): ${e.javaClass.simpleName}")
-            } catch (e: Exception) {
-                Log.w(TAG, "History attempt $attempt failed for $videoId: ${e.javaClass.simpleName}")
+                Log.d(TAG, "History submission HTTP $code for $videoId; remote visibility not verified")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (http: InnerTubeMusicApi.InnerTubeHttpException) {
+                if (http.responseCode == 401 || http.responseCode == 403) {
+                    preferences.claimHistory(pending)
+                } else return@withLock false
+            } catch (_: IOException) {
+                // Before claim: still queued. After claim: outcome uncertain, do not replay.
+                return@withLock preferences.pendingHistory.first().isEmpty()
             }
-            if (attempt < MAX_SUBMIT_ATTEMPTS) delay(RETRY_BASE_DELAY_MS * attempt)
         }
-        Log.w(TAG, "History giving up on $videoId after $MAX_SUBMIT_ATTEMPTS attempts")
+        preferences.pendingHistory.first().isEmpty()
     }
 
     /**
@@ -293,14 +253,16 @@ class YtMusicHistorySyncManager @Inject constructor(
      * parity so originals, remixes, live recordings, covers and sped-up
      * versions are never confused. Returns null when ambiguous.
      */
-    private suspend fun resolveStrictVideoId(pending: PendingListen): String? {
+    private suspend fun resolveStrictVideoId(pending: QueuedHistoryListen): String? {
         if (pending.artist.isBlank()) return null
         val candidate: YouTubeMusicTrack = try {
             innerTube.findBestMatchOrNull(pending.title, pending.artist, prefetchStreams = false)
         } catch (cancellation: CancellationException) {
             throw cancellation
-        } catch (_: Exception) {
-            null
+        } catch (failure: IOException) {
+            throw failure
+        } catch (failure: Exception) {
+            throw IOException("History matching unavailable", failure)
         } ?: return null
         if (candidate.videoId.isBlank()) return null
         if (versionMarkers(candidate.title) != versionMarkers(pending.title)) return null
@@ -324,21 +286,6 @@ class YtMusicHistorySyncManager @Inject constructor(
         }
     }
 
-    private fun newCpn(): String {
-        val alphabet = CPN_ALPHABET
-        return CharArray(CPN_LENGTH) { alphabet[Random.nextInt(alphabet.length)] }.concatToString()
-    }
-
-    private data class PendingListen(
-        val title: String,
-        val artist: String,
-        val album: String?,
-        val videoId: String?,
-        val durationMs: Long,
-        val account: YtConnection,
-        val sessionId: String,
-    )
-
     private companion object {
         const val TAG = "YtHistorySync"
 
@@ -357,16 +304,11 @@ class YtMusicHistorySyncManager @Inject constructor(
         const val RESTART_POSITION_MS = 3_000L
         const val RESTART_FLOOR_MS = 10_000L
 
-        /** Bounded, account-scoped retries for transient failures only. */
-        const val MAX_SUBMIT_ATTEMPTS = 3
-        const val RETRY_BASE_DELAY_MS = 2_000L
-
         /** Track-length agreement for strict matches: 7s or 5%, whichever larger. */
         const val DURATION_TOLERANCE_MS = 7_000L
         const val DURATION_TOLERANCE_RATIO_NUM = 5L
 
         const val CPN_LENGTH = 16
-        const val CPN_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
         val VERSION_SPLIT = Regex("[^a-z0-9]+")
         val VERSION_MARKERS = setOf(
             "live", "remix", "karaoke", "cover", "instrumental", "slowed",

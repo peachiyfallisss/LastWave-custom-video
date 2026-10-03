@@ -541,7 +541,7 @@ class PlaylistViewModel @Inject constructor(
     /** Queues a download for every playlist track that is not already on
      *  disk in Music/LastWave. Already-downloaded (or already-queued)
      *  tracks are skipped so tapping this twice never duplicates files. */
-    fun downloadPlaylist(playlistId: Long) {
+    fun downloadPlaylist(playlistId: Long, includeVideo: Boolean = false) {
         viewModelScope.launch {
             var playlist = _uiState.value.playlists.firstOrNull { it.id == playlistId }
                 ?: _uiState.value.detailPlaylist?.takeIf { it.id == playlistId }
@@ -586,12 +586,12 @@ class PlaylistViewModel @Inject constructor(
                 val alreadyDownloaded = runCatching {
                     trackDownloadManager.isTrackDownloaded(track.name, track.artist, track.youtubeVideoIdOrNull())
                 }.getOrDefault(false)
-                if (alreadyDownloaded) {
+                if (alreadyDownloaded && (!includeVideo || trackDownloadManager.isVideoDownloaded(track.name, track.artist, track.album, track.youtubeVideoIdOrNull()))) {
                     skipped++
                     continue
                 }
                 trackDownloadManager.downloadTrack(track.name, track.artist, track.album, track.artworkUrl,
-                    videoId = track.youtubeVideoIdOrNull())
+                    videoId = track.youtubeVideoIdOrNull(), includeVideo = includeVideo)
                 queued++
             }
             _uiState.update {

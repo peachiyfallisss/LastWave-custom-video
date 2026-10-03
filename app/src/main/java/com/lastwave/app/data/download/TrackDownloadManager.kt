@@ -62,6 +62,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Semaphore
+import com.lastwave.app.data.video.TrackVideoRepository
+import com.lastwave.app.playback.PlayableTrack
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
@@ -144,6 +146,7 @@ class TrackDownloadManager @Inject constructor(
     private val moduleManager: ModuleManager,
     private val flacTranscoder: ModuleFlacTranscoder,
     private val losslessMusicApi: LosslessMusicApi,
+    private val videoRepository: TrackVideoRepository,
 ) {
     private val downloadSourcePreferences = context.getSharedPreferences("lastwave_download_sources", Context.MODE_PRIVATE)
     companion object {
@@ -433,6 +436,7 @@ class TrackDownloadManager @Inject constructor(
         year: String? = null,
         videoId: String? = null,
         durationMs: Long? = null,
+        includeVideo: Boolean = false,
     ) {
         val key = makeDownloadKey(title, artist)
         // Admission and job registration share [admissionLock] with the wipe so a
@@ -442,7 +446,7 @@ class TrackDownloadManager @Inject constructor(
             if (!activeKeys.add(key)) return
             reconnectGenerations[key] = AtomicLong()
             val job = applicationScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs)
+                runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo)
             }
             activeJobs[key] = job
             job.start()
@@ -458,6 +462,7 @@ class TrackDownloadManager @Inject constructor(
         year: String?,
         videoId: String?,
         durationMs: Long?,
+        includeVideo: Boolean,
     ) {
             // Bound the number of simultaneous downloads: each one holds
             // sockets, buffers and (during tagging) a decoded cover bitmap,
@@ -502,14 +507,29 @@ class TrackDownloadManager @Inject constructor(
                 }
                 val storedVideoId = downloadSourcePreferences.getString(existing.mediaStoreUri ?: existing.filePath, null)
                 if (fileStillPresent && DownloadRecordingPolicy.mayReuseFile(videoId, storedVideoId)) {
-                    downloadSlots.release()
-                    forgetDownloadKey(key)
+                    try {
+                        if (includeVideo) {
+                            val videoError = downloadVideoExtra(key, existing, PlayableTrack(title, artist, album, videoId = videoId, durationMs = durationMs), storedVideoId)
+                            updateProgress(DownloadProgress(key, title, artist, 100,
+                                formatBadge = if (videoError == null) "AUDIO + VIDEO" else existing.formatBadge,
+                                isFinished = true, error = videoError))
+                            runCatching {
+                                if (videoError == null) showCompletedNotification(key.hashCode(), title, artist, "AUDIO + VIDEO")
+                                else showErrorNotification(key.hashCode(), key, title, artist, videoError)
+                            }
+                        }
+                    } catch (_: CancellationException) {
+                        _downloads.update { it - key }
+                    } finally {
+                        downloadSlots.release()
+                        forgetDownloadKey(key)
+                    }
                     return
                 }
                 // Row is stale (file was deleted outside the app) — fall through
                 // and re-download; the unique trackKey index means the insert
                 // below will REPLACE this row instead of duplicating it.
-            } else if (!DownloadRecordingPolicy.hasSelectedRecording(videoId)) {
+            } else if (!includeVideo && !DownloadRecordingPolicy.hasSelectedRecording(videoId)) {
                 val dirName = try {
                     currentDownloadDirName()
                 } catch (cancelled: CancellationException) {
@@ -560,6 +580,7 @@ class TrackDownloadManager @Inject constructor(
 
             var destinationUri: Uri? = null
             var destinationFile: File? = null
+            var audioPublished = false
             var tempDownloadFile: File? = null
 
             try {
@@ -1768,6 +1789,12 @@ class TrackDownloadManager @Inject constructor(
                     )
                 }
 
+                audioPublished = true
+                // A video cancellation/failure must not delete a completed audio download.
+                activeUris.remove(key)
+                activeFiles.remove(key)
+                val videoError = if (includeVideo) downloadVideoExtra(key, entity, PlayableTrack(title, artist, album, videoId = videoId, durationMs = durationMs), resolvedYtVideoId) else null
+                val finishedBadge = if (includeVideo && videoError == null) "$formatBadge + VIDEO" else formatBadge
                 updateProgress(
                     DownloadProgress(
                         key = key,
@@ -1776,7 +1803,8 @@ class TrackDownloadManager @Inject constructor(
                         progressPercent = 100,
                         bytesDownloaded = bytesReadTotal,
                         totalBytes = if (totalBytesRecorded > 0) totalBytesRecorded else bytesReadTotal,
-                        formatBadge = formatBadge,
+                        formatBadge = finishedBadge,
+                        error = videoError,
                         isFinished = true,
                     ),
                 )
@@ -1797,11 +1825,15 @@ class TrackDownloadManager @Inject constructor(
                 val completedBadge = if (missingExtras.isEmpty()) formatBadge else {
                     "$formatBadge • ${missingExtras.joinToString(" + ")}"
                 }
-                runCatching { showCompletedNotification(notifId, finalTitle, finalArtist, completedBadge) }
+                runCatching {
+                    if (videoError == null) showCompletedNotification(notifId, finalTitle, finalArtist,
+                        if (includeVideo) "$completedBadge + VIDEO" else completedBadge)
+                    else showErrorNotification(notifId, key, finalTitle, finalArtist, videoError)
+                }
             } catch (cancelled: CancellationException) {
                 // Cancelled by user — clean up partial file
-                destinationUri?.let { runCatching { context.contentResolver.delete(it, null, null) } }
-                destinationFile?.let { runCatching { if (it.exists()) it.delete() } }
+                if (!audioPublished) destinationUri?.let { runCatching { context.contentResolver.delete(it, null, null) } }
+                if (!audioPublished) destinationFile?.let { runCatching { if (it.exists()) it.delete() } }
                 notificationManager?.cancel(notifId)
                 _downloads.update { it - key }
             } catch (oom: OutOfMemoryError) {
@@ -1809,8 +1841,8 @@ class TrackDownloadManager @Inject constructor(
                 // to escape as an uncaught Error and kill the whole process.
                 // Fail just this download instead so the app survives.
                 android.util.Log.e("TrackDownloadManager", "Out of memory downloading $title", oom)
-                destinationUri?.let { runCatching { context.contentResolver.delete(it, null, null) } }
-                destinationFile?.let { runCatching { if (it.exists()) it.delete() } }
+                if (!audioPublished) destinationUri?.let { runCatching { context.contentResolver.delete(it, null, null) } }
+                if (!audioPublished) destinationFile?.let { runCatching { if (it.exists()) it.delete() } }
                 updateProgress(
                     DownloadProgress(
                         key = key,
@@ -1823,8 +1855,8 @@ class TrackDownloadManager @Inject constructor(
                     showErrorNotification(notifId, key, title, artist, "Not enough memory — retry one song at a time")
                 }
             } catch (error: Exception) {
-                destinationUri?.let { runCatching { context.contentResolver.delete(it, null, null) } }
-                destinationFile?.let { runCatching { if (it.exists()) it.delete() } }
+                if (!audioPublished) destinationUri?.let { runCatching { context.contentResolver.delete(it, null, null) } }
+                if (!audioPublished) destinationFile?.let { runCatching { if (it.exists()) it.delete() } }
                 updateProgress(
                     DownloadProgress(
                         key = key,
@@ -1845,6 +1877,33 @@ class TrackDownloadManager @Inject constructor(
                 reconnectGenerations.remove(key)
                 tempDownloadFile?.let { runCatching { if (it.exists()) it.delete() } }
             }
+    }
+
+    fun isVideoDownloaded(title: String, artist: String, album: String?, videoId: String?): Boolean =
+        videoRepository.hasOfflineVideo(PlayableTrack(title, artist, album, videoId = videoId))
+
+    private suspend fun downloadVideoExtra(key: String, audio: DownloadedTrackEntity,
+        track: PlayableTrack, resolvedVideoId: String?): String? {
+        val requestedVideoId = track.videoId
+        return try {
+            var fallback = resolvedVideoId
+            if (fallback == null && videoRepository.customSourceFor(track) == null && !videoRepository.hasOfflineVideo(track)) {
+                val match = innerTube.findBestMatchOrNull(track.title, track.artist, prefetchStreams = false)
+                if (match != null && DownloadRecordingPolicy.mayTryCandidate(requestedVideoId, match.videoId,
+                    track.title, track.album, match.title, match.album, track.artist)) fallback = match.videoId
+            }
+            videoRepository.downloadVideo(track, listOfNotNull(audio.filePath, audio.mediaStoreUri), fallback) { percent ->
+                updateProgress(DownloadProgress(key, audio.title, audio.artist, percent,
+                    formatBadge = "Saving video • audio ready"))
+                runCatching { showDownloadNotification(key.hashCode(), key, audio.title, audio.artist,
+                    percent, false, "Saving video • audio ready") }
+            }
+            null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            "Audio saved; video failed: ${failure.message ?: "try again while online"}"
+        }
     }
 
     private suspend fun downloadToTempFile(
@@ -2930,6 +2989,8 @@ class TrackDownloadManager @Inject constructor(
 
     suspend fun deleteDownloadedTrack(track: DownloadedTrackEntity) = withContext(Dispatchers.IO) {
         downloadedTrackDao.delete(track)
+        videoRepository.deleteOfflineVideo(track.filePath)
+        track.mediaStoreUri?.let { videoRepository.deleteOfflineVideo(it) }
         // Delete physical audio file
         if (!track.mediaStoreUri.isNullOrBlank()) {
             runCatching { context.contentResolver.delete(Uri.parse(track.mediaStoreUri), null, null) }
@@ -2989,6 +3050,7 @@ class TrackDownloadManager @Inject constructor(
                 if (failed.isNotEmpty()) {
                     throw IOException("Failed to delete ${failed.size} downloaded track(s)")
                 }
+                videoRepository.clearOfflineVideos()
             }
         } finally {
             synchronized(admissionLock) {
@@ -3031,6 +3093,10 @@ class TrackDownloadManager @Inject constructor(
                 "TrackDownloadManager",
                 "Kept download row for ${track.title} by ${track.artist}; deletion can be retried",
             )
+        }
+        if (uriDeleted && audioDeleted && lyricsDeleted) {
+            videoRepository.deleteOfflineVideo(track.filePath)
+            track.mediaStoreUri?.let { videoRepository.deleteOfflineVideo(it) }
         }
         return uriDeleted && audioDeleted && lyricsDeleted
     }
