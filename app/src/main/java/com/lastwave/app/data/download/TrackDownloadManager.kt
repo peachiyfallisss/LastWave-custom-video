@@ -1591,7 +1591,9 @@ class TrackDownloadManager @Inject constructor(
                         }
                     }
 
-                    val safeFilename = sanitizeFilename("$finalArtist - $finalTitle") + ".$extension"
+                    val filenameStem = sanitizeFilename("$finalArtist - $finalTitle") +
+                        DownloadRecordingPolicy.filenameSuffix(key, videoId)
+                    val safeFilename = "$filenameStem.$extension"
 
                     // 4. Resolve exact audio duration from downloaded file
                     val durationRetriever = android.media.MediaMetadataRetriever()
@@ -1742,7 +1744,7 @@ class TrackDownloadManager @Inject constructor(
                 if (shouldDownloadLyrics) {
                     val lyricsText = syncedLyrics ?: plainLyrics
                     if (!lyricsText.isNullOrBlank()) {
-                        val lrcFilename = sanitizeFilename("$finalArtist - $finalTitle") + ".lrc"
+                        val lrcFilename = "$filenameStem.lrc"
                         lrcPath = writePublicCompanionFile(lrcFilename, lyricsText, "text/plain", dirName, subpath, customTreeUri)
                     }
                 }
