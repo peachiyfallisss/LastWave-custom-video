@@ -9,7 +9,7 @@ permissions:
   contents: write
   actions: read
 concurrency:
-  group: publish-v4.2.2-custom-video.5
+  group: publish-v4.2.2-custom-video.6
   cancel-in-progress: false
 jobs:
   publish:
@@ -19,13 +19,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      BUILD_RUN: '37146454524'
-      SOURCE_SHA: b1d2e6a98a84096ce72476fefbd564572be889a9
-      RELEASE_TAG: v4.2.2-custom-video.5
+      BUILD_RUN: '37151505784'
+      SOURCE_SHA: 7f746771522191f6e6026966a655001d83a21995
+      RELEASE_TAG: v4.2.2-custom-video.6
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: b1d2e6a98a84096ce72476fefbd564572be889a9
+          ref: 7f746771522191f6e6026966a655001d83a21995
           persist-credentials: false
       - name: Verify successful build and download its APK
         run: |
@@ -56,23 +56,23 @@ jobs:
           set -euo pipefail
           git archive --format=zip --prefix=LastWave-native/ --output=dist/LastWave-custom-video-source.zip "$SOURCE_SHA"
           cat > release-notes.md <<'NOTES'
-          Only the fullscreen icon inside the video remains; the duplicate button below the mode switch is removed. Landscape viewing, play/pause, seeking, and Back/exit keep the same player and position.
+          Qualified offline listens are saved across app restarts and automatically submitted after connectivity returns, with YouTube history sync enabled. Settings shows the pending count. YouTube may show late listens at sync time; submitting history does not guarantee badge credit. Disconnecting, changing channels, starting a new login, or disabling history sync clears pending listens; refreshing the current session keeps them. Uncertain submission outcomes are not replayed.
 
-          The Audio/Video switch is hidden by default. Hold NOW PLAYING for 2 seconds to reveal it, and hold again to hide it. Closing the player hides it again. Settings > Audio & Playback > Player controls lets you keep the switch always visible or adjust the hold duration from 1 to 10 seconds.
+          Song downloads and both playlist download menus now ask for Audio only or Audio + video. Video saves the selected rendition and its own soundtrack for offline playback, including from Downloads. Existing verified audio files can gain video without downloading their audio again. A failed or cancelled video transfer preserves completed audio and reports the failure. Private video files are removed with their associated download.
 
-          Downloads preserve the exact selected YouTube recording instead of substituting studio audio or another concert upload. Playlist bulk downloads now pass each original video ID. Original-recording downloads use the audio quality available from that YouTube upload.
+          Interactive playback starts from the first usable source instead of waiting several seconds for lossless discovery. Direct YouTube and InnerTubeX extraction run together, and a failed direct-client race ends immediately. Eligible quality upgrades continue in the background. Initial playback buffering is reduced from 1.5s to 0.5s.
 
-          Locally saved YouTube playlists keep their original recording URLs, and live/studio uploads remain separate even when their display titles match. Source-verified downloads are reused; old name-only downloads are not trusted as proof of a matching performance. Failed extraction reports an error rather than changing the recording.
+          YouTube/Bilibili progressive video, direct MP4/WebM links, and device videos support saving. Custom HLS/DASH manifest links remain playback-only and report a clear download error. Existing fullscreen and configurable hidden Audio/Video controls remain available.
 
-          **Download:** LastWave-custom-video-debug.apk below. Android 10 or newer; package com.lastwave.app.custom, version 4.2.2-custom-video.5 (code 24).
+          **Download:** LastWave-custom-video-debug.apk below. Android 10 or newer; package com.lastwave.app.custom, version 4.2.2-custom-video.6 (code 25).
 
-          Built from commit b1d2e6a98a84096ce72476fefbd564572be889a9.
-          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37146454524).
-          The release tag includes the publishing-workflow update; app source is identical to the tested commit above. The APK checksum and exact built source archive are included. Fullscreen behavior and the reported Phantom Siita/Ado songs still need checking on your phone.
+          Built from commit 7f746771522191f6e6026966a655001d83a21995.
+          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37151505784).
+          The release tag includes the publishing-workflow update; app source is identical to the tested commit above. The APK checksum and exact built source archive are included. Actual playback speed, background reconnects, and video playback still need checking on your phone.
           NOTES
       - name: Publish release and attach verified files
         run: |
           set -euo pipefail
           # The release tag includes only the publishing-workflow update beyond the built source.
           test "$(gh api "repos/$GH_REPO/compare/$SOURCE_SHA...$GITHUB_SHA" --jq '[.files[].filename] == [".github/workflows/publish-custom-video-release.yml"]')" = true
-          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "LastWave custom video — hidden mode controls" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
+          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "LastWave custom video — offline sync and downloads" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
