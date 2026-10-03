@@ -101,6 +101,8 @@ data class MiscSettings(
     val losslessQuality: Int = 27,
     /** Preferred quality preset for downloads (27: 24/192, 7: 24/96, 6: 16/44.1, 5: 320k, -1: YouTube Music). */
     val downloadQuality: Int = 27,
+    /** Songs downloaded at once, including each song's optional video. */
+    val concurrentDownloads: Int = 2,
     /** When true, queries for Dolby Atmos / max resolution audio. */
     val dolbyAtmosEnabled: Boolean = false,
     /** Optional studio-clarity curve. On by default; Bit-Perfect disables it. */
@@ -249,6 +251,7 @@ class SettingsPreferences @Inject constructor(
         val PREFER_LOSSLESS_STREAMING = booleanPreferencesKey("lw_prefer_lossless_streaming")
         val PREFER_PROVIDER_MODULES = booleanPreferencesKey("lw_prefer_provider_modules")
         val LOSSLESS_QUALITY = intPreferencesKey("lw_lossless_quality")
+        val CONCURRENT_DOWNLOADS = intPreferencesKey("lw_concurrent_downloads")
         val DOWNLOAD_QUALITY = intPreferencesKey("lw_download_quality")
         val MUSIC_ENHANCER = booleanPreferencesKey("lw_music_enhancer")
         val CLARITY_PRESET = intPreferencesKey("lw_clarity_preset")
@@ -295,6 +298,7 @@ class SettingsPreferences @Inject constructor(
                 preferProviderModules = p.readSafely(Keys.PREFER_PROVIDER_MODULES) ?: true,
                 losslessQuality = p.readSafely(Keys.LOSSLESS_QUALITY)?.takeIf { it in LOSSLESS_QUALITIES } ?: 27,
                 downloadQuality = p.readSafely(Keys.DOWNLOAD_QUALITY)?.takeIf { it in DOWNLOAD_QUALITIES } ?: 27,
+                concurrentDownloads = p.readSafely(Keys.CONCURRENT_DOWNLOADS)?.takeIf { it in 1..4 } ?: 2,
                 dolbyAtmosEnabled = p.readSafely(Keys.DOLBY_ATMOS_ENABLED) ?: false,
                 systemEffectsMode = p.readSafely(Keys.SYSTEM_EFFECTS_MODE) ?: false,
                 isStudioMasterClarityEnabled = p.readSafely(Keys.MUSIC_ENHANCER) ?: true,
@@ -394,6 +398,10 @@ class SettingsPreferences @Inject constructor(
             val q = quality.takeIf { it in DOWNLOAD_QUALITIES } ?: 27
             it[Keys.DOWNLOAD_QUALITY] = q
         }
+    }
+
+    suspend fun setConcurrentDownloads(count: Int) {
+        dataStore.edit { it[Keys.CONCURRENT_DOWNLOADS] = count.coerceIn(1, 4) }
     }
 
     suspend fun setDolbyAtmosEnabled(enabled: Boolean) {

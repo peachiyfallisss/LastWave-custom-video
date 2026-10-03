@@ -88,3 +88,11 @@ For a repository you own containing this source, open Actions → Build custom L
 - Progressive YouTube/Bilibili streams, direct MP4/WebM links, and device video files can be saved. Custom HLS/DASH manifest links remain playback-only and report a clear download error.
 - Start interactive playback from the first usable YouTube/lossless stream instead of holding ready YouTube audio for the lossless lookup. Continue eligible quality upgrades in the background. Race the bounded direct YouTube and InnerTubeX extraction methods, and stop the direct-path wait as soon as all clients fail. Reduce initial playback buffering from 1.5s to 0.5s; keep rebuffer protection unchanged.
 - Add persistence/account-isolation tests, exact video/soundtrack and partial-transfer tests, and controlled-time startup race tests. Android playback timing and offline behavior still require verification on a real device.
+
+
+## 4.2.2-custom-video.7
+
+- Download two songs at once by default, including playlist downloads. Settings > Audio & Playback > Downloads > Simultaneous downloads selects 1–4 songs. The search index includes the new setting.
+- Use a FIFO limiter for complete audio + optional video jobs. Raising the limit starts queued work immediately; lowering it lets existing jobs finish and holds new jobs until capacity is available. Cancellation returns reserved permits, including cancellation immediately after a grant.
+- Wait for the saved limit before starting the queue and apply later changes without restarting downloads. Clear-all freezes admission, cancels and joins active/queued work, and remains protected against late file publication.
+- Add tests for simultaneous work, FIFO admission, growing/shrinking the limit, cancellation races, and live preference updates with active/queued download jobs. Existing wipe tests retain a one-song limit to exercise queued workers.

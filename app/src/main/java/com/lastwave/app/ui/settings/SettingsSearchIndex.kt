@@ -156,6 +156,20 @@ object SettingsSearchIndex {
             )
             add(
                 SettingsEntry(
+                    id = "audio.concurrent_downloads",
+                    title = "Simultaneous downloads",
+                    subtitle = "Choose 1–4 songs to download at once",
+                    keywords = listOf("parallel", "simultaneous", "concurrent", "download", "playlist", "speed", "queue"),
+                    icon = Icons.Filled.CloudDownload,
+                    iconContainer = { MaterialTheme.colorScheme.secondaryContainer },
+                    iconTint = { MaterialTheme.colorScheme.onSecondaryContainer },
+                    parentTab = SettingsTab.AUDIO,
+                    section = "Downloads",
+                    type = EntryType.ACTION,
+                )
+            )
+            add(
+                SettingsEntry(
                     id = "audio.dolby_atmos",
                     title = "Dolby Atmos / Spatial Audio",
                     subtitle = "Direct multi-channel spatial audio playback or standard stereo lossless",

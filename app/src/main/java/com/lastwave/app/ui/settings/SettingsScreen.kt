@@ -291,8 +291,9 @@ private fun getTargetSectionIndex(settingId: String?): Int {
     val entry = SettingsSearchIndex.allEntries.firstOrNull { it.id == settingId } ?: return 0
     return when (entry.parentTab) {
         SettingsTab.AUDIO -> when (entry.section) {
-            "Player controls" -> 1
-            "Output & Loudness" -> 2
+            "Downloads" -> 1
+            "Player controls" -> 2
+            "Output & Loudness" -> 3
             else -> 0
         }
         SettingsTab.APPEARANCE -> when (entry.section) {
@@ -472,6 +473,7 @@ fun SettingsScreen(
         }
     }
     var showQualityDialog by remember { mutableStateOf(false) }
+    var showConcurrentDownloadsDialog by remember { mutableStateOf(false) }
     var showDownloadQualityDialog by remember { mutableStateOf(false) }
     var showEqSheet by remember { mutableStateOf(false) }
     var showLyricsAnimationSheet by remember { mutableStateOf(false) }
@@ -924,6 +926,24 @@ fun SettingsScreen(
                     }
                 }
             }
+
+                        item {
+                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                SectionLabel("Downloads")
+                                SettingsGroup(rowCount = 1) { _, position ->
+                                    SettingsActionCard(
+                                        icon = Icons.Filled.CloudDownload,
+                                        iconContainer = MaterialTheme.colorScheme.secondaryContainer,
+                                        iconTint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        title = "Simultaneous downloads",
+                                        subtitle = if (misc.concurrentDownloads == 1) "1 song at a time" else "${misc.concurrentDownloads} songs at once",
+                                        onClick = { showConcurrentDownloadsDialog = true },
+                                        position = position,
+                                        isHighlighted = highlightedSettingId == "audio.concurrent_downloads",
+                                    )
+                                }
+                            }
+                        }
 
                         item {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -2316,6 +2336,14 @@ fun SettingsScreen(
                 }
             }
         }
+    }
+
+    if (showConcurrentDownloadsDialog) {
+        ConcurrentDownloadsDialog(
+            count = misc.concurrentDownloads,
+            onSelect = { count -> viewModel.setConcurrentDownloads(count); showConcurrentDownloadsDialog = false },
+            onDismiss = { showConcurrentDownloadsDialog = false },
+        )
     }
 
     if (showDownloadQualityDialog) {

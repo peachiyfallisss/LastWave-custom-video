@@ -19,7 +19,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.MutableStateFlow
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -55,6 +56,7 @@ class ClearAllDownloadsTest {
     private val resolver = mockk<ContentResolver>(relaxed = true)
     private val context = mockk<Context>(relaxed = true)
     private val settings = mockk<SettingsPreferences>(relaxed = true)
+    private val settingsState = MutableStateFlow(MiscSettings(concurrentDownloads = 1))
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private lateinit var manager: TrackDownloadManager
     private var denyContentUris = false
@@ -66,7 +68,7 @@ class ClearAllDownloadsTest {
         every { context.cacheDir } returns temp.newFolder("cache")
         every { context.filesDir } returns temp.newFolder("files")
         every { context.getSystemService(any<String>()) } returns null
-        every { settings.settings } returns flowOf(MiscSettings())
+        every { settings.settings } returns settingsState
         every { resolver.delete(any<Uri>(), isNull<String>(), isNull<Array<String>>()) } answers {
             val uri = firstArg<Uri>().toString()
             when {
@@ -194,6 +196,34 @@ class ClearAllDownloadsTest {
         assertThat(stored).isEmpty()
         assertThat(manager.wiping()).isFalse()
         assertThat(manager.activeKeys()).isEmpty()
+    }
+
+    @Test
+    fun changingConcurrencyStartsSecondJobAndWipeJoinsBothAndQueuedWork() = runBlocking {
+        val entered = AtomicInteger()
+        val first = CompletableDeferred<Unit>()
+        val second = CompletableDeferred<Unit>()
+        coEvery { dao.findByTrackKey(any()) } coAnswers {
+            when (entered.incrementAndGet()) {
+                1 -> first.complete(Unit)
+                2 -> second.complete(Unit)
+            }
+            suspendCancellableCoroutine { }
+        }
+        manager.downloadTrack("First", "Artist")
+        manager.downloadTrack("Second", "Artist", includeVideo = true)
+        manager.downloadTrack("Third", "Artist")
+        withTimeout(5_000) { first.await() }
+        assertThat(entered.get()).isEqualTo(1)
+        settingsState.value = settingsState.value.copy(concurrentDownloads = 2)
+        withTimeout(5_000) { second.await() }
+        assertThat(entered.get()).isEqualTo(2)
+        val jobs = manager.activeJobs().values.toList()
+        withTimeout(5_000) { manager.clearAllDownloads() }
+        assertThat(jobs.all { it.isCompleted }).isTrue()
+        assertThat(entered.get()).isEqualTo(2)
+        assertThat(manager.activeKeys()).isEmpty()
+        coVerify(exactly = 0) { dao.insert(any()) }
     }
 
     @Test

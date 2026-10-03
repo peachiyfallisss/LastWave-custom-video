@@ -61,7 +61,9 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
 import com.lastwave.app.data.video.TrackVideoRepository
 import com.lastwave.app.playback.PlayableTrack
 import kotlinx.coroutines.withContext
@@ -166,9 +168,6 @@ class TrackDownloadManager @Inject constructor(
         // of parallel ranges could OOM the process after a few downloads.
         private const val DOWNLOAD_BUFFER_SIZE = 128 * 1024 // 128 KB
         private const val PARALLEL_YOUTUBE_PARTS = 4
-        // Bulk downloads run strictly one by one sequentially to avoid
-        // stacking sockets, buffers and bitmap decodes.
-        private const val MAX_CONCURRENT_DOWNLOADS = 1
         private const val MIN_PARALLEL_DOWNLOAD_BYTES = 2L * 1024 * 1024
         private const val MIN_VALID_AUDIO_BYTES = 1_024L
         private const val RECONNECT_POLL_INTERVAL_MS = 500L
@@ -215,13 +214,29 @@ class TrackDownloadManager @Inject constructor(
     private val activeUris = ConcurrentHashMap<String, Uri>()
     private val activeFiles = ConcurrentHashMap<String, File>()
     private val reconnectGenerations = ConcurrentHashMap<String, AtomicLong>()
-    private val downloadSlots = Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    private val downloadSlots = DownloadConcurrencyLimiter()
+    private val downloadLimitReady = CompletableDeferred<Unit>()
 
     private val _downloads = MutableStateFlow<Map<String, DownloadProgress>>(emptyMap())
     val downloads: StateFlow<Map<String, DownloadProgress>> = _downloads.asStateFlow()
 
     init {
         createNotificationChannel()
+        applicationScope.launch(Dispatchers.IO) {
+            try {
+                settingsPreferences.settings.map { it.concurrentDownloads }.distinctUntilChanged().collect { count ->
+                    downloadSlots.setLimit(count)
+                    downloadLimitReady.complete(Unit)
+                }
+            } catch (cancelled: CancellationException) {
+                downloadLimitReady.cancel(cancelled)
+                throw cancelled
+            } catch (failure: Exception) {
+                downloadSlots.setLimit(DownloadConcurrencyLimiter.DEFAULT_LIMIT)
+                downloadLimitReady.complete(Unit)
+                android.util.Log.w("TrackDownloadManager", "Download limit preference unavailable; using default", failure)
+            }
+        }
     }
 
     private fun createNotificationChannel() {
@@ -466,12 +481,12 @@ class TrackDownloadManager @Inject constructor(
         includeVideo: Boolean,
         playbackUrl: String?,
     ) {
-            // Bound the number of simultaneous downloads: each one holds
-            // sockets, buffers and (during tagging) a decoded cover bitmap,
-            // and unbounded overlap OOMed low-RAM devices after a few songs.
+            // One permit covers this song's complete audio + optional video job.
+            // Queued jobs obey the current setting; running jobs finish when the limit shrinks.
             // acquire() is cancellable; a cancel while queued must still
             // release the key so the slot never strands.
             try {
+                downloadLimitReady.await()
                 downloadSlots.acquire()
             } catch (cancelled: CancellationException) {
                 forgetDownloadKey(key)
