@@ -26,7 +26,7 @@ This is modified source, not a verified APK. No upstream repository or account w
 ## Build on a computer
 
 1. Extract this archive. Open the `LastWave-native` folder in Android Studio.
-2. Install JDK 17, Android SDK platform 37 and CMake 3.22.1 when requested. Allow Gradle to download the project's dependencies. The public upstream build generates an empty native secrets header when build secrets are absent; addon access still depends on the configured provider's authentication behavior.
+2. Install JDK 17, Android SDK platform 37.0 (package `platforms;android-37.0`), platform 36 for the USB audio module, and CMake 3.22.1 when requested. The app explicitly sets `compileSdkMinor = 0` to select the 37.0 platform. Allow Gradle to download the project's dependencies. The public upstream build generates an empty native secrets header when build secrets are absent; addon access still depends on the configured provider's authentication behavior.
 3. In that folder, run:
 
 ```sh

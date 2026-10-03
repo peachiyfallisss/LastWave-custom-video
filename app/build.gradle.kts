@@ -14,6 +14,7 @@ plugins {
 android {
     namespace = "com.lastwave.app"
     compileSdk = 37
+    compileSdkMinor = 0
 
     val localProps = Properties().apply {
         val localPropsFile = rootProject.file("local.properties")
