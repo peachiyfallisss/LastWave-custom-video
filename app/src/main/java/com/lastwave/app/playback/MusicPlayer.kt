@@ -438,7 +438,9 @@ class MusicPlayer @Inject constructor(
                 val resolved = if (video) trackVideos.resolve(source!!) else {
                     track.playbackUrl?.let { local ->
                         ResolvedStream(local, track.playbackMimeType ?: "audio/mpeg", null, null, "local:$local")
-                    } ?: resolveTrackAudioStreamWithRetry(track, track.videoId)
+                    } ?: resolveTrackAudioStreamWithRetry(
+                        track, track.videoId, allowLossless = mediaId !in losslessBypassMediaIds,
+                    )
                 }
                 withContext(Dispatchers.Main.immediate) {
                     if (generation != playRequestGeneration.get() || _state.value.current?.mediaIdKey() != mediaId ||
