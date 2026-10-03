@@ -61,7 +61,7 @@ android {
         applicationId = "com.lastwave.app"
         minSdk = (project.findProperty("minSdk") as? String)?.toIntOrNull() ?: 29
         targetSdk = 35
-        versionCode = 22
+        versionCode = 23
         versionName = "4.2.2"
 
         // Native secrets (addon client lock) live strictly in native .so via
@@ -140,7 +140,7 @@ android {
         debug {
             isDebuggable = true
             applicationIdSuffix = ".custom"
-            versionNameSuffix = "-custom-video"
+            versionNameSuffix = "-custom-video.4"
         }
     }
 
@@ -323,4 +323,3 @@ val generateNativeSecrets by tasks.registering(Exec::class) {
 tasks.matching { it.name.startsWith("preBuild") || it.name.startsWith("configureCMake") }.configureEach {
     dependsOn(generateNativeSecrets)
 }
-

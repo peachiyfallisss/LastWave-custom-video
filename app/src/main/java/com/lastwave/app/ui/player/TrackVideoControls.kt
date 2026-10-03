@@ -11,6 +11,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -32,7 +34,7 @@ import com.lastwave.app.playback.PlayableTrack
 
 /** Explicit overlay colors keep the mode switch readable over light and dark artwork. */
 @Composable
-internal fun TrackVideoControls(player: MusicPlayer) {
+internal fun TrackVideoControls(player: MusicPlayer, onFullscreen: () -> Unit) {
     val mode by player.videoState.collectAsStateWithLifecycle()
     Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp), contentAlignment = Alignment.Center) {
         Surface(
@@ -68,6 +70,21 @@ internal fun TrackVideoControls(player: MusicPlayer) {
                         }
                     }
                 }
+            }
+        }
+    }
+    if (mode.enabled) {
+        Box(Modifier.fillMaxWidth().padding(bottom = 8.dp), contentAlignment = Alignment.Center) {
+            FilledTonalButton(
+                onClick = onFullscreen,
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = Color(0xFF181A20), contentColor = Color.White,
+                ),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f)),
+            ) {
+                Icon(Icons.Filled.Fullscreen, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Full screen")
             }
         }
     }

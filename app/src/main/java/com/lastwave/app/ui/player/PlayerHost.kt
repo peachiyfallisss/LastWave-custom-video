@@ -2276,7 +2276,7 @@ private fun FullPlayer(
                                     Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(bottom = 18.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                 ) {
-                                    TrackVideoControls(player)
+                                    TrackVideoControls(player, onFullscreen = { showVideoFullscreen = true })
                                     val sleeveAlpha by animateFloatAsState(
                                         targetValue = if (showFullBleed) 0f else 1f,
                                         animationSpec = tween(350),
