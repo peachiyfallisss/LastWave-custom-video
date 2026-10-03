@@ -9,7 +9,7 @@ permissions:
   contents: write
   actions: read
 concurrency:
-  group: publish-v4.2.2-custom-video.2
+  group: publish-v4.2.2-custom-video.3
   cancel-in-progress: false
 jobs:
   publish:
@@ -19,13 +19,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      BUILD_RUN: '37139757753'
-      SOURCE_SHA: fc86ea4ac362bf55ad3f5e253bf260e95891ce8d
-      RELEASE_TAG: v4.2.2-custom-video.2
+      BUILD_RUN: '37142545259'
+      SOURCE_SHA: 6ecc66d5e73dbfd81e098884f063ecf52a133b61
+      RELEASE_TAG: v4.2.2-custom-video.3
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fc86ea4ac362bf55ad3f5e253bf260e95891ce8d
+          ref: 6ecc66d5e73dbfd81e098884f063ecf52a133b61
           persist-credentials: false
       - name: Verify successful build and download its APK
         run: |
@@ -56,19 +56,19 @@ jobs:
           set -euo pipefail
           git archive --format=zip --prefix=LastWave-native/ --output=dist/LastWave-custom-video-source.zip "$SOURCE_SHA"
           cat > release-notes.md <<'NOTES'
-          The Audio/Video controls are now easier to see, video selection is under the three-dot menu, and selecting a mode no longer shows a checkmark.
+          Videos now have a fullscreen button with landscape viewing, play/pause, seeking, and Back/exit controls. Entering or leaving fullscreen keeps the same player and position.
 
-          Video lookup starts in the background when each song begins. Switching reuses resolved sources, shares any pending lookup, and uses a short visual fade. The video can still need time to buffer.
+          Downloads preserve the exact selected YouTube recording instead of substituting studio audio or another concert upload. Playlist bulk downloads now pass each original video ID. Original-recording downloads use the audio quality available from that YouTube upload.
+
+          Locally saved YouTube playlists keep their original recording URLs, and live/studio uploads remain separate even when their display titles match. Source-verified downloads are reused; old name-only downloads are not trusted as proof of a matching performance. Failed extraction reports an error rather than changing the recording.
 
           **Download:** LastWave-custom-video-debug.apk below. Android 10 or newer; package com.lastwave.app.custom.
 
-          Built from commit fc86ea4ac362bf55ad3f5e253bf260e95891ce8d.
-          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37139757753).
-          Recording/cache regression checks, Android unit tests, APK compilation, and APK v2 signature verification passed.
-
-          The checksum and matching source archive are included. Playback timing still requires checking on a phone.
+          Built from commit 6ecc66d5e73dbfd81e098884f063ecf52a133b61.
+          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37142545259).
+          The APK checksum and exact built source archive are included. Fullscreen behavior and the reported Phantom Siita/Ado songs still need checking on your phone.
           NOTES
       - name: Publish release and attach verified files
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$SOURCE_SHA" --title "LastWave custom video — player update" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
+          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$SOURCE_SHA" --title "LastWave custom video — fullscreen and recording fixes" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
