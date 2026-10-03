@@ -9,7 +9,7 @@ permissions:
   contents: write
   actions: read
 concurrency:
-  group: publish-v4.2.2-custom-video.6
+  group: publish-v4.2.2-custom-video.7
   cancel-in-progress: false
 jobs:
   publish:
@@ -19,13 +19,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      BUILD_RUN: '37151505784'
-      SOURCE_SHA: 7f746771522191f6e6026966a655001d83a21995
-      RELEASE_TAG: v4.2.2-custom-video.6
+      BUILD_RUN: '37154489441'
+      SOURCE_SHA: b1b0ff63b40e880fe464d1fe38eadef0997525f3
+      RELEASE_TAG: v4.2.2-custom-video.7
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 7f746771522191f6e6026966a655001d83a21995
+          ref: b1b0ff63b40e880fe464d1fe38eadef0997525f3
           persist-credentials: false
       - name: Verify successful build and download its APK
         run: |
@@ -56,23 +56,23 @@ jobs:
           set -euo pipefail
           git archive --format=zip --prefix=LastWave-native/ --output=dist/LastWave-custom-video-source.zip "$SOURCE_SHA"
           cat > release-notes.md <<'NOTES'
-          Qualified offline listens are saved across app restarts and automatically submitted after connectivity returns, with YouTube history sync enabled. Settings shows the pending count. YouTube may show late listens at sync time; submitting history does not guarantee badge credit. Disconnecting, changing channels, starting a new login, or disabling history sync clears pending listens; refreshing the current session keeps them. Uncertain submission outcomes are not replayed.
+          Playlist downloads now run two songs simultaneously by default. Choose 1–4 songs at once in Settings > Audio & Playback > Downloads > Simultaneous downloads, or find it through Settings search.
 
-          Song downloads and both playlist download menus now ask for Audio only or Audio + video. Video saves the selected rendition and its own soundtrack for offline playback, including from Downloads. Existing verified audio files can gain video without downloading their audio again. A failed or cancelled video transfer preserves completed audio and reports the failure. Private video files are removed with their associated download.
+          Each song's audio and optional video share one download slot. Raising the limit starts waiting songs immediately; lowering it allows current downloads to finish before starting more. Waiting songs keep their queue order. Cancellation returns reserved capacity, and clearing downloads waits for running and queued jobs to stop.
 
-          Interactive playback starts from the first usable source instead of waiting several seconds for lossless discovery. Direct YouTube and InnerTubeX extraction run together, and a failed direct-client race ends immediately. Eligible quality upgrades continue in the background. Initial playback buffering is reduced from 1.5s to 0.5s.
+          New audio and companion lyrics files use stable identity suffixes to prevent simultaneous downloads with matching or sanitized filenames from overwriting one another. Existing verified downloads are still reusable.
 
-          YouTube/Bilibili progressive video, direct MP4/WebM links, and device videos support saving. Custom HLS/DASH manifest links remain playback-only and report a clear download error. Existing fullscreen and configurable hidden Audio/Video controls remain available.
+          Offline history sync, Audio only / Audio + video downloads, exact selected recordings, fullscreen video, and configurable hidden Audio/Video controls remain available.
 
-          **Download:** LastWave-custom-video-debug.apk below. Android 10 or newer; package com.lastwave.app.custom, version 4.2.2-custom-video.6 (code 25).
+          **Download:** LastWave-custom-video-debug.apk below. Android 10 or newer; package com.lastwave.app.custom, version 4.2.2-custom-video.7 (code 26).
 
-          Built from commit 7f746771522191f6e6026966a655001d83a21995.
-          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37151505784).
-          The release tag includes the publishing-workflow update; app source is identical to the tested commit above. The APK checksum and exact built source archive are included. Actual playback speed, background reconnects, and video playback still need checking on your phone.
+          Built from commit b1b0ff63b40e880fe464d1fe38eadef0997525f3.
+          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37154489441).
+          The release tag includes the publishing-workflow update; app source is identical to the tested commit above. The APK checksum and exact built source archive are included. Actual download speed depends on your phone, connection, and media providers; simultaneous downloads still need checking on your phone.
           NOTES
       - name: Publish release and attach verified files
         run: |
           set -euo pipefail
           # The release tag includes only the publishing-workflow update beyond the built source.
           test "$(gh api "repos/$GH_REPO/compare/$SOURCE_SHA...$GITHUB_SHA" --jq '[.files[].filename] == [".github/workflows/publish-custom-video-release.yml"]')" = true
-          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "LastWave custom video — offline sync and downloads" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
+          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "LastWave custom video — simultaneous downloads" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
