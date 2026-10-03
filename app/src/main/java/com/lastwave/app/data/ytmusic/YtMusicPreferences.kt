@@ -182,7 +182,7 @@ class YtMusicPreferences @Inject constructor(
         (prefs.readSafely(HISTORY_SYNC_ENABLED_KEY) ?: true) &&
             !prefs.readSafely(COOKIES_KEY).isNullOrBlank() &&
             QueuedHistoryListen.scope(
-                prefs.readSafely(ACCOUNT_NAME_KEY).orEmpty(), prefs.safeLong(CONNECTED_AT_KEY),
+                prefs.safeLong(CONNECTED_AT_KEY),
                 prefs.readSafely(ON_BEHALF_OF_USER_KEY), prefs.readSafely(AUTH_USER_INDEX_KEY),
                 prefs.readSafely(PAGE_ID_KEY).orEmpty(),
             ) == scope
@@ -290,14 +290,14 @@ class YtMusicPreferences @Inject constructor(
     ) {
         dataStore.edit { prefs ->
             val oldEpoch = prefs.safeLong(CONNECTED_AT_KEY)
-            val oldScope = QueuedHistoryListen.scope(prefs.readSafely(ACCOUNT_NAME_KEY).orEmpty(), oldEpoch,
+            val oldScope = QueuedHistoryListen.scope(oldEpoch,
                 prefs.readSafely(ON_BEHALF_OF_USER_KEY), prefs.readSafely(AUTH_USER_INDEX_KEY), prefs.readSafely(PAGE_ID_KEY).orEmpty())
             val sameChannel = prefs.readSafely(ON_BEHALF_OF_USER_KEY).orEmpty() == onBehalfOfUser.orEmpty() &&
                 prefs.readSafely(AUTH_USER_INDEX_KEY) == authUserIndex && prefs.readSafely(PAGE_ID_KEY).orEmpty() == pageId
             val keepSession = !newSession && oldEpoch > 0 && !prefs.readSafely(COOKIES_KEY).isNullOrBlank() && sameChannel
             val epoch = if (keepSession) oldEpoch else maxOf(System.currentTimeMillis(), oldEpoch + 1)
             val queue = readHistoryQueue(prefs)
-            val newScope = QueuedHistoryListen.scope(accountName, epoch, onBehalfOfUser, authUserIndex, pageId)
+            val newScope = QueuedHistoryListen.scope(epoch, onBehalfOfUser, authUserIndex, pageId)
             prefs[HISTORY_QUEUE_KEY] = json.encodeToString(if (keepSession) queue.filter { it.accountScope == oldScope }
                 .map { it.copy(accountScope = newScope) } else emptyList())
             prefs[COOKIES_KEY] = json.encodeToString(cookies)

@@ -17,12 +17,12 @@ data class QueuedHistoryListen(
     val listenedAtMillis: Long = System.currentTimeMillis(),
 ) {
     companion object {
-        fun scope(account: YtConnection): String = scope(account.accountName, account.connectedAtMillis,
+        fun scope(account: YtConnection): String = scope(account.connectedAtMillis,
             account.onBehalfOfUser, account.authUserIndex, account.pageId)
 
-        fun scope(name: String, epoch: Long, channel: String?, authIndex: Int?, pageId: String): String =
+        fun scope(epoch: Long, channel: String?, authIndex: Int?, pageId: String): String =
             MessageDigest.getInstance("SHA-256")
-                .digest(listOf(name, epoch.toString(), channel.orEmpty(), authIndex?.toString().orEmpty(), pageId)
+                .digest(listOf(epoch.toString(), channel.orEmpty(), authIndex?.toString().orEmpty(), pageId)
                     .joinToString("\u0000").toByteArray(Charsets.UTF_8))
                 .joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }

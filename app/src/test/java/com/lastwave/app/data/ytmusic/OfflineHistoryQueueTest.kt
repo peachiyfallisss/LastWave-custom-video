@@ -79,6 +79,7 @@ class OfflineHistoryQueueTest {
             prefs.saveConnection(mapOf("session" to "refreshed"), "Account updated", null, null)
             val refreshed = prefs.pendingHistory.first().single()
             assertEquals(pending.id, refreshed.id)
+            assertEquals(pending.accountScope, refreshed.accountScope)
             assertEquals(QueuedHistoryListen.scope(prefs.connection.first()), refreshed.accountScope)
             prefs.saveConnection(mapOf("session" to "other"), "Account updated", null, null, newSession = true)
             assertTrue(prefs.pendingHistory.first().isEmpty())

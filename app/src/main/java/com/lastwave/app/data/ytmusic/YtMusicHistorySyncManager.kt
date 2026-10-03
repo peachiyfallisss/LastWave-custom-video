@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -115,10 +116,13 @@ class YtMusicHistorySyncManager @Inject constructor(
                 Triple(state, account, enabled)
             }.collect { (state, account, enabled) ->
                 if (account != activeAccount || enabled != historyEnabled) {
-                    cancelActive("account or preference change")
+                    val selectionChanged = QueuedHistoryListen.scope(account) != QueuedHistoryListen.scope(activeAccount)
+                    if (selectionChanged || enabled != historyEnabled) {
+                        cancelActive("account selection or preference change")
+                        sessionKey = null
+                    }
                     activeAccount = account
                     historyEnabled = enabled
-                    sessionKey = null
                 }
                 onPlayerState(state)
             }
@@ -242,7 +246,10 @@ class YtMusicHistorySyncManager @Inject constructor(
                 }
                 Log.d(TAG, "History submission HTTP $code for $videoId; remote visibility not verified")
             } catch (cancelled: CancellationException) {
-                throw cancelled
+                // InnerTube also uses cancellation to reject a stale credential snapshot.
+                // Keep remaining listens retryable; real worker cancellation still propagates.
+                if (!currentCoroutineContext().isActive) throw cancelled
+                return@withLock false
             } catch (http: InnerTubeMusicApi.InnerTubeHttpException) {
                 if (http.responseCode == 401 || http.responseCode == 403) {
                     preferences.claimHistory(pending)
