@@ -157,6 +157,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -289,7 +290,11 @@ private fun getTargetSectionIndex(settingId: String?): Int {
     if (settingId == null) return 0
     val entry = SettingsSearchIndex.allEntries.firstOrNull { it.id == settingId } ?: return 0
     return when (entry.parentTab) {
-        SettingsTab.AUDIO -> if (entry.section == "Output & Loudness") 1 else 0
+        SettingsTab.AUDIO -> when (entry.section) {
+            "Player controls" -> 1
+            "Output & Loudness" -> 2
+            else -> 0
+        }
         SettingsTab.APPEARANCE -> when (entry.section) {
             "Accent Color" -> 1
             "Experimental & Features", "Experimental & Player" -> 2
@@ -914,6 +919,36 @@ fun SettingsScreen(
                                     isHighlighted = (highlightedSettingId == "audio.battery_optimization"),
                                 )
                             }
+                        }
+                    }
+                }
+            }
+
+                        item {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SectionLabel("Player controls")
+                    SettingsGroup(rowCount = 2) { index, position ->
+                        when (index) {
+                            0 -> SettingsToggleCard(
+                                icon = Icons.Filled.SmartDisplay,
+                                iconContainer = MaterialTheme.colorScheme.primaryContainer,
+                                iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                title = "Hide Audio/Video switch",
+                                subtitle = if (misc.hideAudioVideoControls) {
+                                    "Hold NOW PLAYING for ${misc.videoControlsHoldSeconds}s to show or hide it"
+                                } else "Always show the mode switch",
+                                checked = misc.hideAudioVideoControls,
+                                onCheckedChange = viewModel::setHideAudioVideoControls,
+                                position = position,
+                                isHighlighted = highlightedSettingId == "audio.video_controls",
+                            )
+                            1 -> VideoControlsHoldDurationRow(
+                                seconds = misc.videoControlsHoldSeconds,
+                                enabled = misc.hideAudioVideoControls,
+                                onSecondsChange = viewModel::setVideoControlsHoldSeconds,
+                                position = position,
+                                isHighlighted = highlightedSettingId == "audio.video_controls_hold",
+                            )
                         }
                     }
                 }
@@ -2751,6 +2786,44 @@ private fun CrossfadeDurationRow(
                 Text("1s (Tight)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
                 Text("6s", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
                 Text("12s (Long)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+            }
+        }
+    }
+}
+
+@Composable
+private fun VideoControlsHoldDurationRow(
+    seconds: Int,
+    enabled: Boolean,
+    onSecondsChange: (Int) -> Unit,
+    position: GroupPosition,
+    isHighlighted: Boolean,
+) {
+    var sliderValue by remember(seconds) { mutableFloatStateOf(seconds.coerceIn(1, 10).toFloat()) }
+    val shape = groupShape(position)
+    Card(
+        shape = shape,
+        colors = CardDefaults.cardColors(
+            containerColor = if (isHighlighted) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+                else MaterialTheme.colorScheme.surfaceContainerHigh,
+        ),
+        modifier = Modifier.fillMaxWidth().settingHighlightGlow(isHighlighted = isHighlighted, shape = shape),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Text("Hold duration", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            Text("${sliderValue.roundToInt()} seconds on NOW PLAYING", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Slider(
+                value = sliderValue,
+                enabled = enabled,
+                onValueChange = { sliderValue = it },
+                onValueChangeFinished = { onSecondsChange(sliderValue.roundToInt()) },
+                valueRange = 1f..10f,
+                steps = 8,
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("1s", style = MaterialTheme.typography.labelSmall)
+                Text("10s", style = MaterialTheme.typography.labelSmall)
             }
         }
     }

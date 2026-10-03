@@ -11,8 +11,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -20,23 +19,28 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.onLongClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import com.lastwave.app.playback.MusicPlayer
 import com.lastwave.app.playback.PlayableTrack
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** Explicit overlay colors keep the mode switch readable over light and dark artwork. */
 @Composable
-internal fun TrackVideoControls(player: MusicPlayer, onFullscreen: () -> Unit) {
+internal fun TrackVideoControls(player: MusicPlayer, showModeSwitch: Boolean) {
     val mode by player.videoState.collectAsStateWithLifecycle()
-    Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp), contentAlignment = Alignment.Center) {
+    if (showModeSwitch) Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp), contentAlignment = Alignment.Center) {
         Surface(
             color = Color(0xFF181A20),
             contentColor = Color.White,
@@ -73,27 +77,42 @@ internal fun TrackVideoControls(player: MusicPlayer, onFullscreen: () -> Unit) {
             }
         }
     }
-    if (mode.enabled) {
-        Box(Modifier.fillMaxWidth().padding(bottom = 8.dp), contentAlignment = Alignment.Center) {
-            FilledTonalButton(
-                onClick = onFullscreen,
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = Color(0xFF181A20), contentColor = Color.White,
-                ),
-                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f)),
-            ) {
-                Icon(Icons.Filled.Fullscreen, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text("Full screen")
-            }
-        }
-    }
     mode.error?.let { message ->
         Surface(color = MaterialTheme.colorScheme.errorContainer,
             contentColor = MaterialTheme.colorScheme.onErrorContainer,
             shape = MaterialTheme.shapes.small,
             modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
             Text(message, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(12.dp))
+        }
+    }
+}
+
+/** The timer is cancelled when a press is released, dragged, or the header leaves composition. */
+@Composable
+internal fun Modifier.videoControlsHoldGesture(
+    enabled: Boolean,
+    seconds: Int,
+    onHold: () -> Unit,
+): Modifier {
+    val latestOnHold by rememberUpdatedState(onHold)
+    return semantics {
+        if (enabled) onLongClick(label = "Show or hide Audio/Video switch") {
+            latestOnHold()
+            true
+        }
+    }.pointerInput(enabled, seconds) {
+        if (enabled) coroutineScope {
+            detectTapGestures(onPress = {
+                val timer = launch {
+                    delay(seconds.coerceIn(1, 10) * 1_000L)
+                    latestOnHold()
+                }
+                try {
+                    tryAwaitRelease()
+                } finally {
+                    timer.cancel()
+                }
+            })
         }
     }
 }

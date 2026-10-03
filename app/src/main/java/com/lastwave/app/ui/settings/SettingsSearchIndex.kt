@@ -93,6 +93,34 @@ object SettingsSearchIndex {
             // ==========================================
             add(
                 SettingsEntry(
+                    id = "audio.video_controls",
+                    title = "Hide Audio/Video switch",
+                    subtitle = "Hold NOW PLAYING to show or hide the playback mode switch",
+                    keywords = listOf("video", "audio", "switch", "hide", "player", "now playing", "hold"),
+                    icon = Icons.Filled.SmartDisplay,
+                    iconContainer = { MaterialTheme.colorScheme.primaryContainer },
+                    iconTint = { MaterialTheme.colorScheme.onPrimaryContainer },
+                    parentTab = SettingsTab.AUDIO,
+                    section = "Player controls",
+                    type = EntryType.TOGGLE,
+                )
+            )
+            add(
+                SettingsEntry(
+                    id = "audio.video_controls_hold",
+                    title = "Hold duration",
+                    subtitle = "Seconds to hold NOW PLAYING before revealing the Audio/Video switch",
+                    keywords = listOf("video", "audio", "hold", "duration", "seconds", "long press", "now playing"),
+                    icon = Icons.Filled.Timer,
+                    iconContainer = { MaterialTheme.colorScheme.secondaryContainer },
+                    iconTint = { MaterialTheme.colorScheme.onSecondaryContainer },
+                    parentTab = SettingsTab.AUDIO,
+                    section = "Player controls",
+                    type = EntryType.SLIDER,
+                )
+            )
+            add(
+                SettingsEntry(
                     id = "audio.streaming_quality",
                     title = "Streaming Quality",
                     subtitle = "Lossless, Hi-Res, FLAC, AAC, MP3, 24-bit / 192 kHz, bit depth & sample rate",

@@ -133,6 +133,9 @@ data class MiscSettings(
     val crossfadeEnabled: Boolean = false,
     /** Crossfade length in seconds; kept within the native settings slider range. */
     val crossfadeSeconds: Int = 5,
+    /** Reveal the mode switch by holding the NOW PLAYING header. */
+    val hideAudioVideoControls: Boolean = true,
+    val videoControlsHoldSeconds: Int = 2,
     /** When true (default), uses the multi-layer dynamic wavy seekbar.
      *  When false, uses the classic standard progress slider in the player tab. */
     val wavySeekbarEnabled: Boolean = true,
@@ -259,6 +262,8 @@ class SettingsPreferences @Inject constructor(
         val LYRICS_FONT_SCALE = floatPreferencesKey("lw_lyrics_font_scale")
         val CROSSFADE_ENABLED = booleanPreferencesKey("lw_crossfade_enabled")
         val CROSSFADE_SECONDS = intPreferencesKey("lw_crossfade_seconds")
+        val HIDE_AUDIO_VIDEO_CONTROLS = booleanPreferencesKey("lw_hide_audio_video_controls")
+        val VIDEO_CONTROLS_HOLD_SECONDS = intPreferencesKey("lw_video_controls_hold_seconds")
         val WAVY_SEEKBAR_ENABLED = booleanPreferencesKey("lw_wavy_seekbar_enabled")
         val ROTATING_BACKGROUND_ENABLED = booleanPreferencesKey("lw_rotating_background_enabled")
         val DOWNLOAD_LYRICS = booleanPreferencesKey("lw_download_lyrics")
@@ -304,6 +309,8 @@ class SettingsPreferences @Inject constructor(
                 lyricsFontScale = (p.readSafely(Keys.LYRICS_FONT_SCALE) ?: 1.0f).coerceIn(0.7f, 1.5f),
                 crossfadeEnabled = p.readSafely(Keys.CROSSFADE_ENABLED) ?: false,
                 crossfadeSeconds = (p.readSafely(Keys.CROSSFADE_SECONDS) ?: 5).coerceIn(1, 12),
+                hideAudioVideoControls = p.readSafely(Keys.HIDE_AUDIO_VIDEO_CONTROLS) ?: true,
+                videoControlsHoldSeconds = (p.readSafely(Keys.VIDEO_CONTROLS_HOLD_SECONDS) ?: 2).coerceIn(1, 10),
                 wavySeekbarEnabled = p.readSafely(Keys.WAVY_SEEKBAR_ENABLED) ?: true,
                 rotatingBackgroundEnabled = p.readSafely(Keys.ROTATING_BACKGROUND_ENABLED) ?: true,
                 downloadLyrics = p.readSafely(Keys.DOWNLOAD_LYRICS) ?: true,
@@ -447,6 +454,14 @@ class SettingsPreferences @Inject constructor(
 
     suspend fun setWavySeekbarEnabled(enabled: Boolean) {
         dataStore.edit { it[Keys.WAVY_SEEKBAR_ENABLED] = enabled }
+    }
+
+    suspend fun setHideAudioVideoControls(enabled: Boolean) {
+        dataStore.edit { it[Keys.HIDE_AUDIO_VIDEO_CONTROLS] = enabled }
+    }
+
+    suspend fun setVideoControlsHoldSeconds(seconds: Int) {
+        dataStore.edit { it[Keys.VIDEO_CONTROLS_HOLD_SECONDS] = seconds.coerceIn(1, 10) }
     }
 
     suspend fun setRotatingBackgroundEnabled(enabled: Boolean) {

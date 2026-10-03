@@ -526,6 +526,12 @@ class SettingsViewModel @Inject constructor(
     fun setWavySeekbarEnabled(enabled: Boolean) = launchSettingsAction("update seekbar style") {
         settingsPreferences.setWavySeekbarEnabled(enabled)
     }
+    fun setHideAudioVideoControls(enabled: Boolean) = launchSettingsAction("update video control visibility") {
+        settingsPreferences.setHideAudioVideoControls(enabled)
+    }
+    fun setVideoControlsHoldSeconds(seconds: Int) = launchSettingsAction("update video control hold duration") {
+        settingsPreferences.setVideoControlsHoldSeconds(seconds)
+    }
     fun setRotatingBackgroundEnabled(enabled: Boolean) = launchSettingsAction("update rotating background") {
         settingsPreferences.setRotatingBackgroundEnabled(enabled)
     }

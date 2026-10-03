@@ -833,6 +833,8 @@ private fun ExpandedPlayer(
         lyricsAnimation = settings.lyricsAnimation,
         wavySeekbarEnabled = settings.wavySeekbarEnabled,
         rotatingBackgroundEnabled = settings.rotatingBackgroundEnabled,
+        hideAudioVideoControls = settings.hideAudioVideoControls,
+        videoControlsHoldSeconds = settings.videoControlsHoldSeconds,
         lyricsOffsetMs = settings.lyricsOffsetMs,
         onSetLyricsOffsetMs = viewModel::setLyricsOffsetMs,
         lyricsFontScale = settings.lyricsFontScale,
@@ -1642,6 +1644,8 @@ private fun FullPlayer(
     lyricsAnimation: LyricsAnimation = LyricsAnimation.APPLE_FLUID,
     wavySeekbarEnabled: Boolean = true,
     rotatingBackgroundEnabled: Boolean = true,
+    hideAudioVideoControls: Boolean = true,
+    videoControlsHoldSeconds: Int = 2,
     lyricsOffsetMs: Long = 0L,
     onSetLyricsOffsetMs: ((Long) -> Unit)? = null,
     lyricsFontScale: Float = 1.0f,
@@ -1662,6 +1666,8 @@ private fun FullPlayer(
     val track = state.current ?: return
     val videoMode by player.videoState.collectAsStateWithLifecycle()
     val isVideoActive = videoMode.enabled
+    var videoControlsRevealed by remember(hideAudioVideoControls) { mutableStateOf(false) }
+    val headerHaptics = LocalHapticFeedback.current
     var showVideoFullscreen by remember(track.videoId, track.title) { mutableStateOf(false) }
     LaunchedEffect(isVideoActive) { if (!isVideoActive) showVideoFullscreen = false }
     var showLyricsOffsetDialog by remember { mutableStateOf(false) }
@@ -2127,8 +2133,18 @@ private fun FullPlayer(
                         )
                     }
                     Column(
-                        Modifier.align(Alignment.Center).padding(horizontal = 96.dp),
+                        Modifier.align(Alignment.Center).padding(horizontal = 96.dp)
+                            .defaultMinSize(minHeight = 48.dp)
+                            .videoControlsHoldGesture(
+                                enabled = hideAudioVideoControls && currentTab == FullPlayerTab.NOW_PLAYING,
+                                seconds = videoControlsHoldSeconds,
+                                onHold = {
+                                    videoControlsRevealed = !videoControlsRevealed
+                                    headerHaptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                },
+                            ),
                         horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
                     ) {
                         Text(
                             when (currentTab) {
@@ -2276,7 +2292,7 @@ private fun FullPlayer(
                                     Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(bottom = 18.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                 ) {
-                                    TrackVideoControls(player, onFullscreen = { showVideoFullscreen = true })
+                                    TrackVideoControls(player, showModeSwitch = !hideAudioVideoControls || videoControlsRevealed)
                                     val sleeveAlpha by animateFloatAsState(
                                         targetValue = if (showFullBleed) 0f else 1f,
                                         animationSpec = tween(350),
