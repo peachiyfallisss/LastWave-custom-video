@@ -1,0 +1,42 @@
+name: Build custom LastWave video APK
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'Screenshot/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Install Android platform and CMake
+        run: sdkmanager 'platforms;android-36' 'platforms;android-37' 'cmake;3.22.1'
+      - name: Verify recording identities
+        run: bash tools/test-recording-identity.sh
+      - name: Test and build APK
+        run: bash gradlew testDebugUnitTest assembleDebug --console=plain --stacktrace
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LastWave-test-reports
+          path: app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LastWave-custom-video-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
