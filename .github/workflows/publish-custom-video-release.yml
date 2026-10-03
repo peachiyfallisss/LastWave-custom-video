@@ -9,7 +9,7 @@ permissions:
   contents: write
   actions: read
 concurrency:
-  group: publish-v4.2.2-custom-video.4
+  group: publish-v4.2.2-custom-video.5
   cancel-in-progress: false
 jobs:
   publish:
@@ -19,13 +19,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      BUILD_RUN: '37144356674'
-      SOURCE_SHA: 2a85754c42b2bf41a6a265d27506a21ac68a7517
-      RELEASE_TAG: v4.2.2-custom-video.4
+      BUILD_RUN: '37146454524'
+      SOURCE_SHA: b1d2e6a98a84096ce72476fefbd564572be889a9
+      RELEASE_TAG: v4.2.2-custom-video.5
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 2a85754c42b2bf41a6a265d27506a21ac68a7517
+          ref: b1d2e6a98a84096ce72476fefbd564572be889a9
           persist-credentials: false
       - name: Verify successful build and download its APK
         run: |
@@ -56,16 +56,18 @@ jobs:
           set -euo pipefail
           git archive --format=zip --prefix=LastWave-native/ --output=dist/LastWave-custom-video-source.zip "$SOURCE_SHA"
           cat > release-notes.md <<'NOTES'
-          Video mode now shows a clearly labeled Full screen button directly below the Audio/Video switch, outside the video surface. Landscape viewing, play/pause, seeking, and Back/exit keep the same player and position.
+          Only the fullscreen icon inside the video remains; the duplicate button below the mode switch is removed. Landscape viewing, play/pause, seeking, and Back/exit keep the same player and position.
+
+          The Audio/Video switch is hidden by default. Hold NOW PLAYING for 2 seconds to reveal it, and hold again to hide it. Closing the player hides it again. Settings > Audio & Playback > Player controls lets you keep the switch always visible or adjust the hold duration from 1 to 10 seconds.
 
           Downloads preserve the exact selected YouTube recording instead of substituting studio audio or another concert upload. Playlist bulk downloads now pass each original video ID. Original-recording downloads use the audio quality available from that YouTube upload.
 
           Locally saved YouTube playlists keep their original recording URLs, and live/studio uploads remain separate even when their display titles match. Source-verified downloads are reused; old name-only downloads are not trusted as proof of a matching performance. Failed extraction reports an error rather than changing the recording.
 
-          **Download:** LastWave-custom-video-debug.apk below. Android 10 or newer; package com.lastwave.app.custom, version 4.2.2-custom-video.4 (code 23).
+          **Download:** LastWave-custom-video-debug.apk below. Android 10 or newer; package com.lastwave.app.custom, version 4.2.2-custom-video.5 (code 24).
 
-          Built from commit 2a85754c42b2bf41a6a265d27506a21ac68a7517.
-          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37144356674).
+          Built from commit b1d2e6a98a84096ce72476fefbd564572be889a9.
+          [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37146454524).
           The release tag includes the publishing-workflow update; app source is identical to the tested commit above. The APK checksum and exact built source archive are included. Fullscreen behavior and the reported Phantom Siita/Ado songs still need checking on your phone.
           NOTES
       - name: Publish release and attach verified files
@@ -73,4 +75,4 @@ jobs:
           set -euo pipefail
           # The release tag includes only the publishing-workflow update beyond the built source.
           test "$(gh api "repos/$GH_REPO/compare/$SOURCE_SHA...$GITHUB_SHA" --jq '[.files[].filename] == [".github/workflows/publish-custom-video-release.yml"]')" = true
-          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "LastWave custom video — fullscreen and recording fixes" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
+          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "LastWave custom video — hidden mode controls" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
