@@ -52,7 +52,8 @@ private val WHITESPACE_RUN = Regex("\\s+")
 fun GeneratedTrack.sameSongAs(other: GeneratedTrack): Boolean {
     val mine = youtubeVideoIdOrNull()
     val theirs = other.youtubeVideoIdOrNull()
-    if (mine != null && mine == theirs) return true
+    // Distinct known uploads may be live/studio performances with identical display titles.
+    if (mine != null && theirs != null) return mine == theirs
     if (key == other.key) return true
     return name.trim().equals(other.name.trim(), ignoreCase = true) &&
         artist.trim().equals(other.artist.trim(), ignoreCase = true)

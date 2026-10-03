@@ -15,7 +15,16 @@ This is modified source for a custom debug APK. No upstream repository or accoun
 - SHA-256: `ce728f8aa26e54716a19ecd222ce40f0c97ae5fffa2ab0a0ea899e7a4164782c`.
 - This compilation does not validate real-device installation, YouTube/Bilibili playback, or badge behavior. No upstream addon credentials were included.
 
-## Latest player update
+## Fullscreen and recording-preservation update
+
+- A fullscreen button opens video in landscape with hidden system bars, play/pause, seeking, and Back/exit controls. It shares the existing player and playhead.
+- Downloads with a selected YouTube ID use that exact recording, including playlist bulk downloads. Failed extraction reports an error instead of choosing another upload. These downloads use the original YouTube audio quality.
+- Playlist bulk downloads now pass each track’s video ID and verify the source of existing files before skipping them. Unverified old downloads can be downloaded again; existing files are not silently deleted.
+- “Make available locally” copies the playlist into LastWave. Its original URLs survive storage and determine playback; locally imported YouTube tracks preserve the original recording instead of substituting a provider result. Different known uploads remain separate even if the title/artist match.
+- Live-marker recognition now also covers a bare LIVE suffix, LIVE prefix, 【LIVE】, and Japanese live-footage labels.
+- 31 recording-identity, 17 exact-recording-policy, and 11 playback-cache regression checks passed locally. Android compilation, fullscreen on a phone, and these exact song downloads require the new build/device check.
+
+## Previous player update
 
 The updates below add clearer controls and background video lookup. The earlier APK and release linked above contain the previous controls. This revision must complete a new Android build before its APK is ready.
 

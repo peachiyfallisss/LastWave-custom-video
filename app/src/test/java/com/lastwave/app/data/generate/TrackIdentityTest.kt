@@ -79,4 +79,12 @@ class TrackIdentityTest {
         val b = GeneratedTrack(name = "A (Official Video)", artist = "X", url = "dQw4w9WgXcQ")
         assertEquals(listOf(a), listOf(a, b).distinctSongs())
     }
+
+    @Test
+    fun differentUploadsWithSameDisplayTitleStaySeparate() {
+        val live = GeneratedTrack(name = "The Mermaid's Song", artist = "Phantom Siita", url = "liveVideo01")
+        val studio = live.copy(url = "studioVid01")
+        assertFalse(live.sameSongAs(studio))
+        assertEquals(listOf(live, studio), listOf(live, studio).distinctSongs())
+    }
 }

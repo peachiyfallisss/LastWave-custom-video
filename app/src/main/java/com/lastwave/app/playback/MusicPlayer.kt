@@ -117,6 +117,7 @@ data class PlayableTrack(
     val playbackUrl: String? = null,
     val playbackMimeType: String? = null,
     val durationMs: Long? = null,
+    val preserveOriginalRecording: Boolean = false,
 )
 
 @Serializable
@@ -5329,7 +5330,9 @@ class MusicPlayer @Inject constructor(
         }
 
         // 3. If entity found in DB, check its mediaStoreUri and filePath
-        if (downloaded != null) {
+        if (downloaded != null && (!track.requiresOriginalRecording() ||
+            appContext.getSharedPreferences("lastwave_download_sources", Context.MODE_PRIVATE)
+                .getString(downloaded.mediaStoreUri ?: downloaded.filePath, null) == track.videoId)) {
             val candidates = mutableListOf<String>()
             downloaded.mediaStoreUri?.takeIf(String::isNotBlank)?.let { candidates.add(it) }
             downloaded.filePath.takeIf(String::isNotBlank)?.let { if (!candidates.contains(it)) candidates.add(it) }
@@ -5356,6 +5359,7 @@ class MusicPlayer @Inject constructor(
         }
 
         // 4. Fallback: Search physical download directories (Music/<folder> + legacy Music/LastWave)
+        if (track.requiresOriginalRecording()) return null
         val candidateExtensions = listOf("flac", "m4a", "mp3", "opus", "ogg", "webm", "wav")
         val candidateBases = listOf(
             "$artist - $title",
@@ -5456,7 +5460,7 @@ class MusicPlayer @Inject constructor(
         losslessBudget: LosslessBudget = LosslessBudget.Interactive,
     ): ResolvedStream = withContext(Dispatchers.IO) {
         val misc = runCatching { settingsPreferences.settings.first() }.getOrDefault(MiscSettings())
-        val key = listOf(track.title, track.artist, track.album, videoId, allowLossless, misc.losslessQuality, misc.dolbyAtmosEnabled, misc.preferLosslessStreaming, misc.preferProviderModules, excludedLosslessUrls, allowLocalDownloads, losslessBudget)
+        val key = listOf(track.title, track.artist, track.album, track.preserveOriginalRecording, videoId, allowLossless, misc.losslessQuality, misc.dolbyAtmosEnabled, misc.preferLosslessStreaming, misc.preferProviderModules, excludedLosslessUrls, allowLocalDownloads, losslessBudget)
         val now = SystemClock.elapsedRealtime()
         resolutionRequests.entries.removeIf { now - it.value.first > 60_000L }
         if (resolutionRequests.size >= 64) {
@@ -5488,7 +5492,7 @@ class MusicPlayer @Inject constructor(
         allowLocalDownloads: Boolean = true,
         losslessBudget: LosslessBudget = LosslessBudget.Interactive,
     ): ResolvedStream {
-        val wantLossless = allowLossless &&
+        val wantLossless = allowLossless && !track.requiresOriginalRecording() &&
             misc.preferLosslessStreaming &&
             misc.losslessQuality != com.lastwave.app.data.lossless.LosslessMusicApi.QUALITY_YOUTUBE
 
@@ -5820,24 +5824,28 @@ class MusicPlayer @Inject constructor(
         track: PlayableTrack,
         videoId: String?,
     ): ResolvedStream {
+        val requestedVideoId = if (track.requiresOriginalRecording()) track.videoId else videoId
         val canSearch = track.title.isNotBlank()
         val rejectedVideoIds = mutableSetOf<String>()
         var lastFailure: Throwable? = null
         var resolved: YouTubeAudioStream? = null
         // Single direct attempt (no retry): instant peek cache, else one resolve.
         // Desktop-style: if videoId is known, resolve directly without search.
-        if (!videoId.isNullOrBlank()) {
-            resolved = innerTube.peekCachedStream(videoId)
+        if (!requestedVideoId.isNullOrBlank()) {
+            resolved = innerTube.peekCachedStream(requestedVideoId)
             if (resolved == null) {
                 try {
-                    resolved = innerTube.resolveAudioStream(videoId)
+                    resolved = innerTube.resolveAudioStream(requestedVideoId)
                 } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (failure: Throwable) {
                     lastFailure = failure
-                    rejectedVideoIds += videoId
+                    rejectedVideoIds += requestedVideoId
                 }
             }
+        }
+        if (resolved == null && track.requiresOriginalRecording()) {
+            throw java.io.IOException("The original recording is unavailable. No other version was substituted.", lastFailure)
         }
         // Search-only attempts (the direct attempt above already ran). Two, not
         // three: each extra attempt re-ran the whole waterfall and multiplied a
@@ -5999,7 +6007,7 @@ class MusicPlayer @Inject constructor(
         generation: Long,
         currentStream: ResolvedStream,
     ) {
-        if (currentStream.cacheKey.startsWith("video:") || _videoState.value.loading) return
+        if (currentStream.cacheKey.startsWith("video:") || _videoState.value.loading || track.requiresOriginalRecording()) return
         val misc = runCatching { runBlocking { settingsPreferences.settings.first() } }.getOrDefault(MiscSettings())
         val wantLossless = misc.preferLosslessStreaming &&
             misc.losslessQuality != LosslessMusicApi.QUALITY_YOUTUBE
@@ -6957,10 +6965,16 @@ fun GeneratedTrack.toPlayableTrack(): PlayableTrack {
         album = album,
         artworkUrl = artworkUrl ?: videoId?.let { "https://i.ytimg.com/vi/$it/hqdefault.jpg" },
         videoId = videoId,
+        preserveOriginalRecording = videoId != null,
     )
 }
 
-private fun PlayableTrack.queueKey(): String = "$title|$artist".lowercase()
+private fun PlayableTrack.requiresOriginalRecording(): Boolean =
+    com.lastwave.app.data.download.DownloadRecordingPolicy.preservePlayback(videoId, preserveOriginalRecording,
+        title, album, artist)
+
+private fun PlayableTrack.queueKey(): String = videoId?.takeIf(String::isNotBlank)?.let { "yt:$it" }
+    ?: "$title|$artist".lowercase()
 
 /**
  * Samsung One UI ships vendor FLAC decoders (c2.sec.flac.decoder,

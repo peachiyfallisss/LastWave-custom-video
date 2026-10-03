@@ -15,6 +15,10 @@ public final class RecordingIdentityRegression {
         check(true, "Song (Official Music Video)", null, "Song", null, "Artist");
         check(true, "Song [Official Audio]", null, "Song", null, "Artist");
         check(true, "Live Forever", null, "Live Forever", null, "Artist");
+        check(false, "The Mermaid's Song LIVE", null, "The Mermaid's Song", null, "Phantom Siita");
+        check(false, "LIVE - The Mermaid's Song", null, "The Mermaid's Song", null, "Phantom Siita");
+        check(false, "【LIVE】Monstruo", null, "Monstruo", null, "Ado");
+        check(false, "唱 (ライブ映像)", null, "唱", null, "Ado");
         check(true, "Artist - Song", null, "Song", null, "Artist");
         check(false, "Song (Acoustic)", null, "Song", null, "Artist");
         check(false, "Song", null, "Song (Instrumental)", null, "Artist");

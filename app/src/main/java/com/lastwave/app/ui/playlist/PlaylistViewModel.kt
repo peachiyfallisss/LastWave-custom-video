@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.lastwave.app.data.artwork.ArtworkRepository
 import com.lastwave.app.data.generate.GenerateRepository
 import com.lastwave.app.data.generate.GeneratedTrack
+import com.lastwave.app.data.generate.youtubeVideoIdOrNull
 import com.lastwave.app.data.generate.RECOMMENDATION_TRACK_COUNT
 import com.lastwave.app.data.naming.PlaylistNamer
 import com.lastwave.app.data.playlist.PlaylistRepository
@@ -583,13 +584,14 @@ class PlaylistViewModel @Inject constructor(
                     continue
                 }
                 val alreadyDownloaded = runCatching {
-                    trackDownloadManager.isTrackDownloaded(track.name, track.artist)
+                    trackDownloadManager.isTrackDownloaded(track.name, track.artist, track.youtubeVideoIdOrNull())
                 }.getOrDefault(false)
                 if (alreadyDownloaded) {
                     skipped++
                     continue
                 }
-                trackDownloadManager.downloadTrack(track.name, track.artist, track.album, track.artworkUrl)
+                trackDownloadManager.downloadTrack(track.name, track.artist, track.album, track.artworkUrl,
+                    videoId = track.youtubeVideoIdOrNull())
                 queued++
             }
             _uiState.update {

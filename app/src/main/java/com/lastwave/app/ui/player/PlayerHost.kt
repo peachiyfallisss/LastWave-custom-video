@@ -17,6 +17,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.lastwave.app.ui.common.PredictiveBackScreen
 import androidx.compose.animation.Crossfade
+import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -1661,6 +1662,8 @@ private fun FullPlayer(
     val track = state.current ?: return
     val videoMode by player.videoState.collectAsStateWithLifecycle()
     val isVideoActive = videoMode.enabled
+    var showVideoFullscreen by remember(track.videoId, track.title) { mutableStateOf(false) }
+    LaunchedEffect(isVideoActive) { if (!isVideoActive) showVideoFullscreen = false }
     var showLyricsOffsetDialog by remember { mutableStateOf(false) }
     val isCanvasActive = canvasEnabled && canvas != null && !isVideoActive
     val showFullBleed = canvasFullBleedEnabled && !isVideoActive
@@ -2445,7 +2448,16 @@ private fun FullPlayer(
                                                     Crossfade(targetState = isVideoActive,
                                                         animationSpec = tween(180), label = "audioVideoArtwork") { videoVisible ->
                                                         if (videoVisible) {
-                                                            TrackVideoSurface(player, state.isPlaying, Modifier.fillMaxSize())
+                                                            Box(Modifier.fillMaxSize()) {
+                                                                if (!showVideoFullscreen) {
+                                                                    TrackVideoSurface(player, state.isPlaying, Modifier.fillMaxSize())
+                                                                }
+                                                                IconButton(onClick = { showVideoFullscreen = true },
+                                                                    modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp)
+                                                                        .background(Color.Black.copy(alpha = 0.65f), CircleShape)) {
+                                                                    Icon(Icons.Filled.Fullscreen, "Fullscreen video", tint = Color.White)
+                                                                }
+                                                            }
                                                         } else {
                                                             PlayerArtwork(
                                                                 track = track,
@@ -2757,6 +2769,9 @@ private fun FullPlayer(
         }
     }
     TrackVideoSourcePicker(track, player, visible = showVideoSources, onDismiss = { showVideoSources = false })
+    if (showVideoFullscreen && isVideoActive) {
+        FullscreenVideoPlayer(player, onDismiss = { showVideoFullscreen = false })
+    }
     if (showTrackMenu) {
         TrackContextMenuSheet(
             target = TrackMenuTarget.Track(track.title, track.artist, ""),

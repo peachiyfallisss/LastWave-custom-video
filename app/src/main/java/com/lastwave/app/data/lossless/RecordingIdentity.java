@@ -42,6 +42,8 @@ public final class RecordingIdentity {
         }
         // Albums often consist solely of the word Live; titles such as Live Forever do not.
         if (album != null && Pattern.compile("\\blive\\b|ライブ|ライヴ").matcher(normalized(album)).find()) result.add("live");
+        if (title != null && Pattern.compile("(?:\\S\\s+live\\s*$|^live\\s*[-–—:|]|【[^】]*\\blive\\b|ライブ映像|ライヴ映像)")
+                .matcher(normalized(title)).find()) result.add("live");
         return result;
     }
 

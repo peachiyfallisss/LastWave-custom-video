@@ -145,6 +145,7 @@ class TrackDownloadManager @Inject constructor(
     private val flacTranscoder: ModuleFlacTranscoder,
     private val losslessMusicApi: LosslessMusicApi,
 ) {
+    private val downloadSourcePreferences = context.getSharedPreferences("lastwave_download_sources", Context.MODE_PRIVATE)
     companion object {
         const val CHANNEL_ID = "lastwave_downloads"
         const val ACTION_CANCEL_DOWNLOAD = "com.lastwave.app.ACTION_CANCEL_DOWNLOAD"
@@ -333,7 +334,7 @@ class TrackDownloadManager @Inject constructor(
         return false
     }
 
-    suspend fun isTrackDownloaded(title: String, artist: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun isTrackDownloaded(title: String, artist: String, videoId: String? = null): Boolean = withContext(Dispatchers.IO) {
         val key = makeDownloadKey(title, artist)
         val existing = runCatching {
             downloadedTrackDao.findByTrackKey(key)
@@ -359,8 +360,12 @@ class TrackDownloadManager @Inject constructor(
                     f.exists() && f.length() > 0
                 }.getOrDefault(false)
             }
-            if (fileStillPresent) return@withContext true
+            val storedVideoId = downloadSourcePreferences.getString(existing.mediaStoreUri ?: existing.filePath, null)
+            if (fileStillPresent && DownloadRecordingPolicy.mayReuseFile(videoId, storedVideoId)) return@withContext true
         }
+
+        // A matching filename does not prove that it contains this performance.
+        if (DownloadRecordingPolicy.hasSelectedRecording(videoId)) return@withContext false
 
         // Check if file already exists in the download directories (active folder + legacy default, incl. subfolders).
         // The walk is guarded: on scoped-storage devices the public Music dir
@@ -495,7 +500,8 @@ class TrackDownloadManager @Inject constructor(
                         f.exists() && f.length() > 0
                     }.getOrDefault(false)
                 }
-                if (fileStillPresent) {
+                val storedVideoId = downloadSourcePreferences.getString(existing.mediaStoreUri ?: existing.filePath, null)
+                if (fileStillPresent && DownloadRecordingPolicy.mayReuseFile(videoId, storedVideoId)) {
                     downloadSlots.release()
                     forgetDownloadKey(key)
                     return
@@ -503,7 +509,7 @@ class TrackDownloadManager @Inject constructor(
                 // Row is stale (file was deleted outside the app) — fall through
                 // and re-download; the unique trackKey index means the insert
                 // below will REPLACE this row instead of duplicating it.
-            } else {
+            } else if (!DownloadRecordingPolicy.hasSelectedRecording(videoId)) {
                 val dirName = try {
                     currentDownloadDirName()
                 } catch (cancelled: CancellationException) {
@@ -609,7 +615,7 @@ class TrackDownloadManager @Inject constructor(
                     }.getOrNull()
                 }
 
-                if (preloadedBestMatch == null && (resolvedArtworkUrl == null || resolvedAlbum == null)) {
+                if (videoId.isNullOrBlank() && preloadedBestMatch == null && (resolvedArtworkUrl == null || resolvedAlbum == null)) {
                     preloadedBestMatch = runCatching {
                         innerTube.findBestMatch(effTitle, effArtistForLookup, prefetchStreams = false)
                     }.getOrNull()
@@ -694,7 +700,10 @@ class TrackDownloadManager @Inject constructor(
                 // Honor the download-quality setting (Dolby Atmos / stereo tiers / YouTube).
                 // Do not force Dolby Atmos unless the user explicitly selected it as download quality.
                 val requestedDownloadQuality = misc.downloadQuality
-                val isYouTubeRequested = requestedDownloadQuality == LosslessMusicApi.QUALITY_YOUTUBE
+                // Search selections carry an exact recording ID. Provider title/artist searches
+                // cannot prove it is that performance (concert uploads often omit "Live").
+                val isSelectedRecording = DownloadRecordingPolicy.hasSelectedRecording(videoId)
+                val isYouTubeRequested = isSelectedRecording || requestedDownloadQuality == LosslessMusicApi.QUALITY_YOUTUBE
 
                 // 1. Provider module (.lwp engine): progressive clear FLAC/MP3 or segmented DASH (Dolby Atmos / Tidal Hi-Res)
                 var moduleDescriptor: SegmentedStreamDescriptor? = null
@@ -867,7 +876,10 @@ class TrackDownloadManager @Inject constructor(
                             }
                         }
 
-                        val desc = if (resolvedUrl != null) null else runCatching {
+                        val hasVersionMarkers = com.lastwave.app.data.lossless.RecordingIdentity
+                            .variants(finalTitle, resolvedAlbum, finalArtist).isNotEmpty()
+                        // Modules do not expose verified rendition metadata; preserve marked versions.
+                        val desc = if (resolvedUrl != null || hasVersionMarkers) null else runCatching {
                             moduleResolver.resolve(finalTitle, finalArtist, downloadQuality)
                         }.getOrNull()
                         if (desc != null && desc.stream.baseUrl.isNotBlank()) {
@@ -1163,9 +1175,8 @@ class TrackDownloadManager @Inject constructor(
                     try {
                         updateStage("Finding YouTube stream…", notify = true)
                         val lookupArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: ""
-                        // Same path as playback (SimpMusic/Metrolist/ArchiveTune style):
-                        // explicit videoId first, then cached/broad search candidates.
-                        // Never single-shot strict match — search more, try each.
+                        // Try both extractors for the same selected video. Never replace a
+                        // failed concert/live upload with a different recording from search.
                         // Budgeted: downloads run strictly serially, so one
                         // wedged track must not stall the whole batch queue.
                         val ytFallbackStartMs = android.os.SystemClock.elapsedRealtime()
@@ -1175,18 +1186,20 @@ class TrackDownloadManager @Inject constructor(
                             preloadedBestMatch?.takeIf { match -> match.videoId == it }
                                 ?: YouTubeMusicTrack(videoId = it, title = finalTitle, artist = finalArtist)
                         }
-                        preloadedBestMatch?.videoId?.takeIf { it.isNotBlank() }?.let { id ->
+                        preloadedBestMatch?.videoId?.takeIf { it.isNotBlank() && !isSelectedRecording }?.let { id ->
                             candidateTracks.putIfAbsent(id, preloadedBestMatch!!)
                         }
                         // Broad search is capped inside (10 merged candidates);
                         // the 60s resolve budget below bounds the slow path.
-                        runCatching {
-                            innerTube.findDownloadCandidates(finalTitle, lookupArtist)
-                        }.getOrDefault(emptyList()).forEach { track ->
-                            candidateTracks.putIfAbsent(track.videoId, track)
+                        if (!isSelectedRecording) {
+                            runCatching {
+                                innerTube.findDownloadCandidates(finalTitle, lookupArtist)
+                            }.getOrDefault(emptyList()).forEach { track ->
+                                candidateTracks.putIfAbsent(track.videoId, track)
+                            }
                         }
                         // Last resort: legacy single strict match (kept for metadata only).
-                        if (candidateTracks.isEmpty()) {
+                        if (candidateTracks.isEmpty() && !isSelectedRecording) {
                             runCatching {
                                 innerTube.findBestMatch(finalTitle, lookupArtist, prefetchStreams = false)
                             }.getOrNull()?.let { track ->
@@ -1199,6 +1212,8 @@ class TrackDownloadManager @Inject constructor(
                         var chosenTrack: YouTubeMusicTrack? = null
                         var lastResolveError: Throwable? = null
                         for ((candidateId, candidateTrack) in candidateTracks) {
+                            if (!DownloadRecordingPolicy.mayTryCandidate(videoId, candidateId,
+                                finalTitle, resolvedAlbum, candidateTrack.title, candidateTrack.album, finalArtist)) continue
                             if (android.os.SystemClock.elapsedRealtime() - ytFallbackStartMs > ytResolveBudgetMs) {
                                 android.util.Log.w(
                                     "TrackDownloadManager",
@@ -1230,8 +1245,11 @@ class TrackDownloadManager @Inject constructor(
                                 break
                             }
                         }
-                        val resolvedStream = pickedStream
-                            ?: throw (lastResolveError ?: IOException("No playable YouTube stream for $finalTitle by $finalArtist"))
+                        val resolvedStream = pickedStream ?: if (isSelectedRecording) {
+                            throw IOException("Could not download the selected recording. No other version was substituted. Try again while online.", lastResolveError)
+                        } else {
+                            throw (lastResolveError ?: IOException("No playable YouTube stream for $finalTitle by $finalArtist"))
+                        }
                         if (resolvedArtworkUrl == null) {
                             resolvedArtworkUrl = (chosenTrack?.artworkUrl ?: preloadedBestMatch?.artworkUrl)
                                 ?.takeIf { ArtworkNormalizer.isRealImage(it) }
@@ -1712,6 +1730,17 @@ class TrackDownloadManager @Inject constructor(
                     downloadedAtMillis = System.currentTimeMillis(),
                 )
                 downloadedTrackDao.insert(entity)
+                // Only completed YouTube transfers prove a file belongs to that video ID.
+                // Legacy/name-only matches are re-downloaded rather than trusted as this rendition.
+                downloadSourcePreferences.edit().apply {
+                    if (resolvedYtVideoId != null && !isLossless && moduleDescriptor == null) {
+                        putString(entity.filePath, resolvedYtVideoId)
+                        entity.mediaStoreUri?.let { putString(it, resolvedYtVideoId) }
+                    } else {
+                        remove(entity.filePath)
+                        entity.mediaStoreUri?.let { remove(it) }
+                    }
+                }.apply()
 
                 // 6b. Module DRM: persist offline keys + sidecar so the encrypted
                 // file plays without network. Skipped when transcoding already

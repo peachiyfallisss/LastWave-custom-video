@@ -8,6 +8,9 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import com.lastwave.app.data.generate.GeneratedTrack
+import com.lastwave.app.data.generate.toStored
+import com.lastwave.app.data.generate.toGenerated
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33], manifest = Config.NONE)
@@ -34,5 +37,16 @@ class VideoTrackIdentityTest {
         assertEquals("lastwave", audio.localConfiguration?.uri?.scheme)
         assertEquals("youtube", audio.localConfiguration?.uri?.host)
         assertEquals(song, audio.toPlayableTrack())
+    }
+
+    @Test fun locallySavedPlaylistKeepsOriginalVideoAndPlaybackPolicy() {
+        val imported = GeneratedTrack("The Mermaid's Song", "Phantom Siita",
+            url = "https://music.youtube.com/watch?v=liveVideo01")
+        val restored = imported.toStored().toGenerated().toPlayableTrack()
+        assertEquals("liveVideo01", restored.videoId)
+        assertEquals(true, restored.preserveOriginalRecording)
+        val item = restored.toMediaItem(MusicPlayer.ResolvedStream("https://example.com/live.webm",
+            "audio/webm", null, null, "yt:liveVideo01"))
+        assertEquals(restored, item.toPlayableTrack())
     }
 }
