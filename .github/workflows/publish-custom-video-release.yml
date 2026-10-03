@@ -66,9 +66,11 @@ jobs:
 
           Built from commit 6ecc66d5e73dbfd81e098884f063ecf52a133b61.
           [Successful build and tests](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/37142545259).
-          The APK checksum and exact built source archive are included. Fullscreen behavior and the reported Phantom Siita/Ado songs still need checking on your phone.
+          The release tag includes the publishing-workflow update; app source is identical to the tested commit above. The APK checksum and exact built source archive are included. Fullscreen behavior and the reported Phantom Siita/Ado songs still need checking on your phone.
           NOTES
       - name: Publish release and attach verified files
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$SOURCE_SHA" --title "LastWave custom video — fullscreen and recording fixes" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
+          # The release tag includes only the publishing-workflow update beyond the built source.
+          test "$(gh api "repos/$GH_REPO/compare/$SOURCE_SHA...$GITHUB_SHA" --jq '[.files[].filename] == [".github/workflows/publish-custom-video-release.yml"]')" = true
+          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "LastWave custom video — fullscreen and recording fixes" --notes-file release-notes.md --latest dist/LastWave-custom-video-debug.apk dist/LastWave-custom-video-debug.apk.sha256 dist/LastWave-custom-video-source.zip
