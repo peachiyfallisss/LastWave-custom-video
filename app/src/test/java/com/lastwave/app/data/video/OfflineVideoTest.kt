@@ -77,4 +77,28 @@ class OfflineVideoTest {
         repo.remove(live)
         assertTrue(repo.hasOfflineVideo(live))
     }
+
+    @Test fun oneConcertCanHaveDifferentSongSegments() {
+        val repo = repository()
+        val odo = PlayableTrack("Odo", "Ado", "Concert", videoId = "odo12345678")
+        val songTwo = PlayableTrack("Song Two", "Ado", "Concert", videoId = "songtwo1234")
+        val source = "https://example.test/ado-concert.mp4"
+
+        repo.save(odo, source, 5_754_000L, 5_900_000L)
+        repo.save(songTwo, source, 5_900_000L, 6_120_000L)
+
+        assertEquals(source, repo.sourceFor(odo))
+        assertEquals(VideoSegmentRange(5_754_000L, 5_900_000L), repo.segmentFor(odo))
+        assertEquals(VideoSegmentRange(5_900_000L, 6_120_000L), repo.segmentFor(songTwo))
+        repo.remove(odo)
+        assertNull(repo.segmentFor(odo))
+        assertEquals(VideoSegmentRange(5_900_000L, 6_120_000L), repo.segmentFor(songTwo))
+    }
+
+    @Test fun segmentRangeMustBeCompleteAndOrdered() {
+        val repo = repository()
+        assertTrue(runCatching { repo.save(live, "https://example.test/concert.mp4", 10_000L, null) }.isFailure)
+        assertTrue(runCatching { repo.save(live, "https://example.test/concert.mp4", 20_000L, 10_000L) }.isFailure)
+        assertNull(repo.segmentFor(live))
+    }
 }

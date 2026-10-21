@@ -408,8 +408,10 @@ class MusicPlayer @Inject constructor(
 
     fun videoSource(track: PlayableTrack): String? = trackVideos.customSourceFor(track)
 
-    fun setVideoSource(track: PlayableTrack, source: String) {
-        trackVideos.save(track, source)
+    fun videoSegment(track: PlayableTrack): com.lastwave.app.data.video.VideoSegmentRange? = trackVideos.segmentFor(track)
+
+    fun setVideoSource(track: PlayableTrack, source: String, segmentStartMs: Long? = null, segmentEndMs: Long? = null) {
+        trackVideos.save(track, source, segmentStartMs, segmentEndMs)
         switchPlaybackMode(track, true)
     }
 
@@ -435,6 +437,7 @@ class MusicPlayer @Inject constructor(
             return@onMain
         }
         val source = if (video) trackVideos.sourceFor(track) else null
+        val segment = if (video) trackVideos.segmentFor(track) else null
         if (videoPrefetch?.let { it.mediaId != mediaId || (video && it.source != source) } == true) {
             cancelVideoPrefetch()
         }
@@ -465,20 +468,27 @@ class MusicPlayer @Inject constructor(
                         track, track.videoId, allowLossless = mediaId !in losslessBypassMediaIds,
                     )
                 }
+                if (segment != null && resolved.durationMs != null && segment.endMs > resolved.durationMs) {
+                    throw IllegalArgumentException("The segment end is past the selected video's duration.")
+                }
                 withContext(Dispatchers.Main.immediate) {
                     if (generation != playRequestGeneration.get() || _state.value.current?.mediaIdKey() != mediaId ||
                         index != player.currentMediaItemIndex) return@withContext
                     val position = player.currentPosition.coerceAtLeast(0L)
-                        .let { pos -> resolved.durationMs?.takeIf { it > 0L }?.let { pos.coerceAtMost((it - 1L).coerceAtLeast(0L)) } ?: pos }
+                        .let { pos ->
+                            val duration = segment?.durationMs ?: resolved.durationMs
+                            duration?.takeIf { it > 0L }?.let { pos.coerceAtMost((it - 1L).coerceAtLeast(0L)) } ?: pos
+                        }
                     _videoState.value = VideoPlaybackState(mediaId, source, enabled = video)
                     rememberPlaybackModeStream(mediaId, source, resolved)
                     registerPreparedStream(resolved)
                     _state.update { it.copy(audioCodec = null, bitrateKbps = null, bitDepth = null,
-                        samplingRateKHz = null, isLossless = false, durationMs = resolved.durationMs ?: track.durationMs ?: 0L,
+                        samplingRateKHz = null, isLossless = false,
+                        durationMs = segment?.durationMs ?: resolved.durationMs ?: track.durationMs ?: 0L,
                         error = null, isBuffering = wasPlaying, sourceSwitchSerial = it.sourceSwitchSerial + 1L) }
                     stagePendingQuality(mediaId, resolved)
                     resetPlayhead(position, mediaId)
-                    replaceMediaItemPreservingShuffle(index, track.toMediaItem(resolved))
+                    replaceMediaItemPreservingShuffle(index, track.toMediaItem(resolved, segment?.startMs, segment?.endMs))
                     player.seekTo(index, position)
                     player.prepare()
                     player.playWhenReady = wasPlaying
@@ -6869,7 +6879,15 @@ private fun PlayableTrack.withYoutubeArtwork(): PlayableTrack =
         copy(artworkUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg")
     } else this
 
-internal fun PlayableTrack.toMediaItem(resolved: MusicPlayer.ResolvedStream? = null): MediaItem {
+internal fun PlayableTrack.toMediaItem(
+    resolved: MusicPlayer.ResolvedStream? = null,
+    clipStartMs: Long? = null,
+    clipEndMs: Long? = null,
+): MediaItem {
+    require((clipStartMs == null) == (clipEndMs == null)) { "Both segment boundaries are required." }
+    if (clipStartMs != null && clipEndMs != null) {
+        require(clipStartMs >= 0L && clipEndMs > clipStartMs) { "The segment end must be after its start." }
+    }
     val playbackUri = if (resolved != null) {
         Uri.parse(resolved.url)
     } else if (playbackUrl?.isNotBlank() == true) {
@@ -6895,6 +6913,14 @@ internal fun PlayableTrack.toMediaItem(resolved: MusicPlayer.ResolvedStream? = n
         .setUri(playbackUri)
         .apply {
             (resolved?.mimeType ?: playbackMimeType)?.takeIf(String::isNotBlank)?.let(::setMimeType)
+            if (clipStartMs != null && clipEndMs != null) {
+                setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(clipStartMs)
+                        .setEndPositionMs(clipEndMs)
+                        .build(),
+                )
+            }
             resolved?.let {
                 setCustomCacheKey(it.cacheKey)
                 // Segmented provider module: MPD uri + Widevine config so the

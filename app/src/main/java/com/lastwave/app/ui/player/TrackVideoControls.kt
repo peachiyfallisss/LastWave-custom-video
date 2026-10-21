@@ -14,6 +14,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -23,6 +24,7 @@ import androidx.compose.ui.semantics.onLongClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.input.pointer.pointerInput
@@ -30,8 +32,10 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
+import com.lastwave.app.data.video.VideoSegmentRange
 import com.lastwave.app.playback.MusicPlayer
 import com.lastwave.app.playback.PlayableTrack
+import java.util.Locale
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -127,12 +131,18 @@ internal fun TrackVideoSourcePicker(
 ) {
     val context = LocalContext.current
     var link by remember(track) { mutableStateOf(player.videoSource(track).orEmpty().takeUnless { it.startsWith("content:") }.orEmpty()) }
+    var segmentStart by remember(track) { mutableStateOf(player.videoSegment(track)?.startMs?.let(::formatVideoTimestamp).orEmpty()) }
+    var segmentEnd by remember(track) { mutableStateOf(player.videoSegment(track)?.endMs?.let(::formatVideoTimestamp).orEmpty()) }
     var localError by remember(track) { mutableStateOf<String?>(null) }
     var fileError by remember { mutableStateOf<String?>(null) }
     var pendingFileTrack by remember { mutableStateOf<PlayableTrack?>(null) }
+    var pendingSegment by remember { mutableStateOf<VideoSegmentRange?>(null) }
     LaunchedEffect(visible, track) {
         if (visible) {
             link = player.videoSource(track).orEmpty().takeUnless { it.startsWith("content:") }.orEmpty()
+            val range = player.videoSegment(track)
+            segmentStart = range?.startMs?.let(::formatVideoTimestamp).orEmpty()
+            segmentEnd = range?.endMs?.let(::formatVideoTimestamp).orEmpty()
             localError = null
         }
     }
@@ -142,24 +152,43 @@ internal fun TrackVideoSourcePicker(
         if (uri != null && target != null) {
             runCatching {
                 context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                player.setVideoSource(target, uri.toString())
+                player.setVideoSource(target, uri.toString(), pendingSegment?.startMs, pendingSegment?.endMs)
             }.onFailure { fileError = "Could not keep access to this file. Choose it from device storage." }
         }
     }
+    val segmentInput = parseVideoSegmentRange(segmentStart, segmentEnd)
     if (visible) {
         AlertDialog(
             onDismissRequest = onDismiss,
             title = { Text("Video for ${track.title}") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("Video mode plays the video's soundtrack. Your song stays linked to your library and listening history.")
+                    Text("Video mode plays the video's soundtrack for this segment while keeping the selected song's metadata. Eligible listens can use its linked YouTube ID for enabled YouTube Music history sync; Last.fm scrobbles use the song metadata.")
                     OutlinedTextField(value = link, onValueChange = { link = it; localError = null },
                         label = { Text("YouTube, Bilibili, or direct video link") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Text("To map several songs from one concert, use the same video source for each song and set a different segment range.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(value = segmentStart, onValueChange = { segmentStart = it; localError = null },
+                            label = { Text("Segment start") }, placeholder = { Text("1:35:54") }, singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii), modifier = Modifier.weight(1f))
+                        OutlinedTextField(value = segmentEnd, onValueChange = { segmentEnd = it; localError = null },
+                            label = { Text("Segment end") }, placeholder = { Text("1:38:20") }, singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii), modifier = Modifier.weight(1f))
+                    }
+                    Text("Leave both times blank to use the whole video. Timestamps accept MM:SS or HH:MM:SS.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     localError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     TextButton(onClick = {
-                        pendingFileTrack = track
-                        onDismiss()
-                        picker.launch(arrayOf("video/*"))
+                        segmentInput.fold(
+                            onSuccess = { range ->
+                                pendingFileTrack = track
+                                pendingSegment = range
+                                onDismiss()
+                                picker.launch(arrayOf("video/*"))
+                            },
+                            onFailure = { localError = it.message ?: "Enter a valid segment range." },
+                        )
                     }) { Text("Choose from device") }
                     if (player.videoSource(track) != null) {
                         TextButton(onClick = { player.removeVideoSource(track); link = ""; onDismiss() }) {
@@ -169,8 +198,11 @@ internal fun TrackVideoSourcePicker(
                 }
             },
             confirmButton = {
-                TextButton(enabled = link.isNotBlank(), onClick = {
-                    runCatching { player.setVideoSource(track, link) }
+                TextButton(enabled = link.isNotBlank() && segmentInput.isSuccess, onClick = {
+                    runCatching {
+                        val range = segmentInput.getOrThrow()
+                        player.setVideoSource(track, link, range?.startMs, range?.endMs)
+                    }
                         .onSuccess { onDismiss(); localError = null }
                         .onFailure { localError = it.message ?: "Invalid video link." }
                 }) { Text("Use video") }
@@ -182,6 +214,37 @@ internal fun TrackVideoSourcePicker(
         AlertDialog(onDismissRequest = { fileError = null }, title = { Text("Could not open video") },
             text = { Text(message) }, confirmButton = { TextButton(onClick = { fileError = null }) { Text("OK") } })
     }
+}
+
+/** Parse an optional HH:MM:SS / MM:SS segment. A successful null means full-video playback. */
+internal fun parseVideoSegmentRange(start: String, end: String): Result<VideoSegmentRange?> {
+    if (start.isBlank() && end.isBlank()) return Result.success(null)
+    if (start.isBlank() || end.isBlank()) return Result.failure(IllegalArgumentException("Enter both a segment start and end time, or leave both blank."))
+    val startMs = parseVideoTimestamp(start) ?: return Result.failure(IllegalArgumentException("Enter the start as MM:SS or HH:MM:SS."))
+    val endMs = parseVideoTimestamp(end) ?: return Result.failure(IllegalArgumentException("Enter the end as MM:SS or HH:MM:SS."))
+    if (endMs <= startMs) return Result.failure(IllegalArgumentException("The segment end must be after its start."))
+    return Result.success(VideoSegmentRange(startMs, endMs))
+}
+
+private fun parseVideoTimestamp(input: String): Long? {
+    val pieces = input.trim().split(':')
+    if (pieces.size !in 2..3 || pieces.any { it.isBlank() || it.any { ch -> !ch.isDigit() } }) return null
+    val values = pieces.map { it.toLongOrNull() ?: return null }
+    if (values.last() !in 0..59 || (values.size == 3 && values[1] !in 0..59)) return null
+    return runCatching {
+        val totalSeconds = if (values.size == 2) Math.addExact(Math.multiplyExact(values[0], 60L), values[1])
+        else Math.addExact(Math.addExact(Math.multiplyExact(values[0], 3_600L), Math.multiplyExact(values[1], 60L)), values[2])
+        Math.multiplyExact(totalSeconds, 1_000L)
+    }.getOrNull()
+}
+
+private fun formatVideoTimestamp(milliseconds: Long): String {
+    val totalSeconds = milliseconds.coerceAtLeast(0L) / 1_000L
+    val hours = totalSeconds / 3_600L
+    val minutes = (totalSeconds % 3_600L) / 60L
+    val seconds = totalSeconds % 60L
+    return if (hours > 0) String.format(Locale.ROOT, "%d:%02d:%02d", hours, minutes, seconds)
+    else String.format(Locale.ROOT, "%d:%02d", minutes, seconds)
 }
 
 /** Attach the actual music player: no second soundtrack, timer, or history event. */

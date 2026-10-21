@@ -31,6 +31,14 @@ class VideoTrackIdentityTest {
         assertEquals(song, song.toMediaItem(stream).toPlayableTrack())
     }
 
+    @Test fun concertSegmentClipsSourceWithoutChangingSongIdentity() {
+        val stream = MusicPlayer.ResolvedStream("content://videos/concert", "video/mp4", null, null, "video:concert")
+        val item = song.toMediaItem(stream, clipStartMs = 5_754_000L, clipEndMs = 5_900_000L)
+        assertEquals(5_754_000L, item.clippingConfiguration.startPositionMs)
+        assertEquals(5_900_000L, item.clippingConfiguration.endPositionMs)
+        assertEquals(song, item.toPlayableTrack())
+    }
+
     @Test fun switchingBackRetainsOriginalAudioAndDuration() {
         val video = song.toMediaItem(MusicPlayer.ResolvedStream("content://videos/42", "video/mp4", null, null, "video:test"))
         val audio = video.toPlayableTrack().toMediaItem()

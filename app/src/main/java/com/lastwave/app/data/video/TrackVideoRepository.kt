@@ -29,6 +29,12 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** Time window (on the selected video source) associated with one song. */
+data class VideoSegmentRange(val startMs: Long, val endMs: Long) {
+    init { require(startMs >= 0L && endMs > startMs) }
+    val durationMs: Long get() = endMs - startMs
+}
+
 /** Store stable page/document URIs; signed CDN URLs are resolved ahead of playback and refreshed when needed. */
 @Singleton
 class TrackVideoRepository @Inject constructor(
@@ -61,6 +67,14 @@ class TrackVideoRepository @Inject constructor(
             offlineManifest(identityKey(track)) != null
 
     fun customSourceFor(track: PlayableTrack): String? = preferences.getString(identityKey(track), null)
+
+    /** Segment boundaries are optional; no range means the full selected video is used. */
+    fun segmentFor(track: PlayableTrack): VideoSegmentRange? {
+        val identity = identityKey(track)
+        val start = preferences.getLong("segment-start:$identity", -1L)
+        val end = preferences.getLong("segment-end:$identity", -1L)
+        return if (start >= 0L && end > start) VideoSegmentRange(start, end) else null
+    }
 
     private fun offlineManifest(identity: String): JSONObject? = runCatching {
         val raw = preferences.getString("offline:$identity", null) ?: return@runCatching null
@@ -189,15 +203,32 @@ class TrackVideoRepository @Inject constructor(
         }.commit()
     }
 
-    fun save(track: PlayableTrack, source: String) {
+    fun save(track: PlayableTrack, source: String, segmentStartMs: Long? = null, segmentEndMs: Long? = null) {
         val uri = Uri.parse(source.trim())
         require(uri.scheme == "content" || uri.scheme == "https") {
             "Choose a video from your device or an HTTPS video link."
         }
-        preferences.edit().putString(identityKey(track), source.trim()).apply()
+        require((segmentStartMs == null) == (segmentEndMs == null)) { "Enter both a segment start and end time, or leave both blank." }
+        if (segmentStartMs != null && segmentEndMs != null) {
+            require(segmentStartMs >= 0L && segmentEndMs > segmentStartMs) { "The segment end must be after its start." }
+        }
+        val identity = identityKey(track)
+        preferences.edit().apply {
+            putString(identity, source.trim())
+            if (segmentStartMs != null && segmentEndMs != null) {
+                putLong("segment-start:$identity", segmentStartMs)
+                putLong("segment-end:$identity", segmentEndMs)
+            } else {
+                remove("segment-start:$identity")
+                remove("segment-end:$identity")
+            }
+        }.apply()
     }
 
-    fun remove(track: PlayableTrack) { preferences.edit().remove(identityKey(track)).apply() }
+    fun remove(track: PlayableTrack) {
+        val identity = identityKey(track)
+        preferences.edit().remove(identity).remove("segment-start:$identity").remove("segment-end:$identity").apply()
+    }
 
     suspend fun resolve(source: String): MusicPlayer.ResolvedStream = withContext(Dispatchers.IO) {
         val uri = Uri.parse(source)
