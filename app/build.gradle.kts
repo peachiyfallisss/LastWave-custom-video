@@ -61,7 +61,7 @@ android {
         applicationId = "com.lastwave.app"
         minSdk = (project.findProperty("minSdk") as? String)?.toIntOrNull() ?: 29
         targetSdk = 35
-        versionCode = 26
+        versionCode = 27
         versionName = "4.2.2"
 
         // Native secrets (addon client lock) live strictly in native .so via
@@ -140,7 +140,7 @@ android {
         debug {
             isDebuggable = true
             applicationIdSuffix = ".custom"
-            versionNameSuffix = "-custom-video.7"
+            versionNameSuffix = "-custom-video.8"
         }
     }
 
