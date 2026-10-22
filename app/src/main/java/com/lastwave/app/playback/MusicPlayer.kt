@@ -118,6 +118,10 @@ data class PlayableTrack(
     val playbackMimeType: String? = null,
     val durationMs: Long? = null,
     val preserveOriginalRecording: Boolean = false,
+    /** Optional per-queue-item concert source; unlike TrackVideoRepository's saved source this is not global to the song. */
+    val videoSourceUrl: String? = null,
+    val videoSegmentStartMs: Long? = null,
+    val videoSegmentEndMs: Long? = null,
 )
 
 @Serializable
@@ -141,6 +145,8 @@ data class VideoPlaybackState(
     val loading: Boolean = false,
     val error: String? = null,
     val requestedVideo: Boolean? = null,
+    val segmentStartMs: Long? = null,
+    val segmentEndMs: Long? = null,
 )
 
 data class MusicPlayerState(
@@ -406,9 +412,13 @@ class MusicPlayer @Inject constructor(
     /** The same player owns video sound, progress, focus, and system media controls. */
     val videoOutputPlayer: Player get() = player
 
-    fun videoSource(track: PlayableTrack): String? = trackVideos.customSourceFor(track)
+    fun videoSource(track: PlayableTrack): String? = track.videoSourceUrl?.takeIf(String::isNotBlank)
+        ?: trackVideos.customSourceFor(track)
 
-    fun videoSegment(track: PlayableTrack): com.lastwave.app.data.video.VideoSegmentRange? = trackVideos.segmentFor(track)
+    fun videoSegment(track: PlayableTrack): com.lastwave.app.data.video.VideoSegmentRange? = track.videoSegmentStartMs
+        ?.takeIf { start -> track.videoSegmentEndMs?.let { it > start } == true }
+        ?.let { start -> com.lastwave.app.data.video.VideoSegmentRange(start, track.videoSegmentEndMs!!) }
+        ?: trackVideos.segmentFor(track)
 
     fun setVideoSource(track: PlayableTrack, source: String, segmentStartMs: Long? = null, segmentEndMs: Long? = null) {
         trackVideos.save(track, source, segmentStartMs, segmentEndMs)
@@ -436,8 +446,8 @@ class MusicPlayer @Inject constructor(
             _videoState.update { it.copy(error = "Disconnect casting before switching audio/video.") }
             return@onMain
         }
-        val source = if (video) trackVideos.sourceFor(track) else null
-        val segment = if (video) trackVideos.segmentFor(track) else null
+        val source = if (video) videoSource(track) ?: trackVideos.sourceFor(track) else null
+        val segment = if (video) videoSegment(track) else null
         if (videoPrefetch?.let { it.mediaId != mediaId || (video && it.source != source) } == true) {
             cancelVideoPrefetch()
         }
@@ -479,7 +489,13 @@ class MusicPlayer @Inject constructor(
                             val duration = segment?.durationMs ?: resolved.durationMs
                             duration?.takeIf { it > 0L }?.let { pos.coerceAtMost((it - 1L).coerceAtLeast(0L)) } ?: pos
                         }
-                    _videoState.value = VideoPlaybackState(mediaId, source, enabled = video)
+                    _videoState.value = VideoPlaybackState(
+                        mediaId = mediaId,
+                        source = source,
+                        enabled = video,
+                        segmentStartMs = segment?.startMs,
+                        segmentEndMs = segment?.endMs,
+                    )
                     rememberPlaybackModeStream(mediaId, source, resolved)
                     registerPreparedStream(resolved)
                     _state.update { it.copy(audioCodec = null, bitrateKbps = null, bitDepth = null,
@@ -512,7 +528,7 @@ class MusicPlayer @Inject constructor(
     private fun prefetchTrackVideo(track: PlayableTrack) {
         if (isCasting) return
         val mediaId = track.mediaIdKey()
-        val source = trackVideos.sourceFor(track) ?: return
+        val source = videoSource(track) ?: trackVideos.sourceFor(track) ?: return
         val pending = videoPrefetch
         if (pending != null && (pending.mediaId != mediaId || pending.source != source)) cancelVideoPrefetch()
         if (playbackModeStreams.get(mediaId, source, System.currentTimeMillis() + 15_000L) != null) return
@@ -898,6 +914,21 @@ class MusicPlayer @Inject constructor(
                         applyDacRoutingFor(currentSourceRateHz())
                     }
                 if (outgoingPlayer == null) cancelCrossfade()
+                // Concert queue entries keep the YouTube song as the media
+                // identity, but play the matching time range from the single
+                // imported show recording. Switch before resolving a normal
+                // YouTube audio placeholder; subsequent queue transitions
+                // repeat this for each mapped song.
+                val currentVideoSegment = videoSegment(currentTrack)
+                if (!currentTrack.videoSourceUrl.isNullOrBlank() &&
+                    (_videoState.value.mediaId != currentTrack.mediaIdKey() || !_videoState.value.enabled ||
+                        _videoState.value.source != currentTrack.videoSourceUrl ||
+                        _videoState.value.segmentStartMs != currentVideoSegment?.startMs ||
+                        _videoState.value.segmentEndMs != currentVideoSegment?.endMs)
+                ) {
+                    switchPlaybackMode(currentTrack, true)
+                    return
+                }
                 // Queue placeholders are intentionally non-playable until
                 // their signed stream has been resolved. Resolve an item
                 // before Media3 can attempt to open its lastwave:// URI.

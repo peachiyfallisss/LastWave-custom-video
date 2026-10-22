@@ -59,6 +59,7 @@ import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shuffle
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -156,6 +157,7 @@ fun PlaylistScreen(
     var menuTarget by remember { mutableStateOf<Pair<Long, GeneratedTrack>?>(null) }
     var selectedPlaylists by remember { mutableStateOf(setOf<Long>()) }
     var showMultipleDeleteConfirm by remember { mutableStateOf(false) }
+    var showConcertLibrary by remember { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -192,6 +194,12 @@ fun PlaylistScreen(
                             modifier = Modifier.size(40.dp),
                         ) {
                             Icon(Icons.Filled.Add, contentDescription = "Create custom playlist")
+                        }
+                        IconButton(
+                            onClick = { showConcertLibrary = true },
+                            modifier = Modifier.size(40.dp),
+                        ) {
+                            Icon(Icons.Filled.VideoLibrary, contentDescription = "Concert videos")
                         }
                         Box {
                             Surface(
@@ -506,6 +514,10 @@ fun PlaylistScreen(
             onDeleteScrobble = { name, artist -> viewModel.deleteScrobble(name, artist) },
             onRefreshArtwork = { viewModel.refreshArtwork(track.name, track.artist) },
         )
+    }
+
+    if (showConcertLibrary) {
+        ConcertLibraryDialog(onDismiss = { showConcertLibrary = false })
     }
 }
 
