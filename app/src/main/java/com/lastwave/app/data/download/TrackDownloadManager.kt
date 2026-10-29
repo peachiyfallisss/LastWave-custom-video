@@ -151,6 +151,7 @@ class TrackDownloadManager @Inject constructor(
     private val videoRepository: TrackVideoRepository,
 ) {
     private val downloadSourcePreferences = context.getSharedPreferences("lastwave_download_sources", Context.MODE_PRIVATE)
+    private val retryRequests = ConcurrentHashMap<String, () -> Unit>()
     companion object {
         const val CHANNEL_ID = "lastwave_downloads"
         const val ACTION_CANCEL_DOWNLOAD = "com.lastwave.app.ACTION_CANCEL_DOWNLOAD"
@@ -409,6 +410,7 @@ class TrackDownloadManager @Inject constructor(
     }
 
     fun cancelDownload(key: String) {
+        retryRequests.remove(key)
         activeKeys.remove(key)
         reconnectGenerations.remove(key)?.incrementAndGet()
         val job = activeJobs.remove(key)
@@ -443,6 +445,14 @@ class TrackDownloadManager @Inject constructor(
         return true
     }
 
+    fun retryDownload(key: String) {
+        val request = retryRequests[key] ?: return
+        applicationScope.launch {
+            activeJobs[key]?.join()
+            if (retryRequests[key] === request && _downloads.value[key]?.error != null) request()
+        }
+    }
+
     fun downloadTrack(
         title: String,
         artist: String,
@@ -460,6 +470,8 @@ class TrackDownloadManager @Inject constructor(
         synchronized(admissionLock) {
             if (downloadsWiping) return
             if (!activeKeys.add(key)) return
+            retryRequests[key] = { downloadTrack(title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl) }
+            updateProgress(DownloadProgress(key, title, artist, formatBadge = "Queued"))
             reconnectGenerations[key] = AtomicLong()
             val job = applicationScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
                 runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl)
@@ -534,12 +546,12 @@ class TrackDownloadManager @Inject constructor(
                                 if (videoError == null) showCompletedNotification(key.hashCode(), title, artist, "AUDIO + VIDEO")
                                 else showErrorNotification(key.hashCode(), key, title, artist, videoError)
                             }
-                        }
+                        } else updateProgress(DownloadProgress(key, title, artist, 100, formatBadge = existing.formatBadge, isFinished = true))
                     } catch (_: CancellationException) {
                         _downloads.update { it - key }
                     } finally {
                         downloadSlots.release()
-                        forgetDownloadKey(key)
+                        forgetDownloadKey(key, keepResult = true)
                     }
                     return
                 }
@@ -566,8 +578,9 @@ class TrackDownloadManager @Inject constructor(
                     }
                 }.getOrDefault(false)
                 if (found) {
+                    updateProgress(DownloadProgress(key, title, artist, 100, isFinished = true))
                     downloadSlots.release()
-                    forgetDownloadKey(key)
+                    forgetDownloadKey(key, keepResult = true)
                     return
                 }
             }
@@ -647,7 +660,9 @@ class TrackDownloadManager @Inject constructor(
                 var resolvedAlbum = safeAlbumInput?.takeIf { it.isNotBlank() }
                 var preloadedBestMatch: YouTubeMusicTrack? = null
 
-                if (!videoId.isNullOrBlank()) {
+                // A known recording with valid metadata can resolve its stream immediately.
+                // Album/cover enrichment must not add a redundant blocking player request.
+                if (!videoId.isNullOrBlank() && artistWasStat) {
                     preloadedBestMatch = runCatching {
                         innerTube.fetchSongDetails(videoId)
                     }.getOrNull()
@@ -690,6 +705,8 @@ class TrackDownloadManager @Inject constructor(
 
                 val artworkFallback = if (resolvedArtworkUrl == null) {
                     async(Dispatchers.IO) {
+                        kotlinx.coroutines.withTimeoutOrNull(4_000L) {
+                        try {
                         artworkRepository.resolve(finalTitle, finalArtist)
                         val cacheKey = ArtworkNormalizer.cacheKey(finalTitle, finalArtist)
                         artworkRepository.resolved.value[cacheKey]
@@ -697,6 +714,9 @@ class TrackDownloadManager @Inject constructor(
                             ?: kotlinx.coroutines.withTimeoutOrNull(3_500L) {
                                 artworkRepository.resolved.first { it.containsKey(cacheKey) }[cacheKey]
                             }?.takeIf { ArtworkNormalizer.isRealImage(it) }
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
+                        }
                     }
                 } else {
                     null
@@ -704,6 +724,16 @@ class TrackDownloadManager @Inject constructor(
 
                 // 1. Resolve source — respect user's download quality preference (Lossless tiers or YouTube Music)
                 val misc = runCatching { settingsPreferences.settings.first() }.getOrDefault(MiscSettings())
+                val shouldDownloadLyrics = misc.downloadLyrics
+                // Start enrichment before stream resolution and transfer, not after the bytes arrive.
+                val lyricsDeferred = if (shouldDownloadLyrics) async(Dispatchers.IO) {
+                    kotlinx.coroutines.withTimeoutOrNull(8_000L) {
+                        try { lyricsRepository.getLyrics(finalTitle, finalArtist, resolvedAlbum,
+                            durationSeconds = durationMs?.let { (it / 1000L).toInt() }, videoId = videoId) }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
+                    }
+                } else null
                 ensureDownloadStillAllowed()
                 // Custom SAF folder (e.g. SD card): resolve once per download.
                 // A stale grant (revoked permission / removed card) fails fast
@@ -1215,8 +1245,7 @@ class TrackDownloadManager @Inject constructor(
                         val lookupArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: ""
                         // Try both extractors for the same selected video. Never replace a
                         // failed concert/live upload with a different recording from search.
-                        // Budgeted: downloads run strictly serially, so one
-                        // wedged track must not stall the whole batch queue.
+                        // Budgeted: a wedged recording must not monopolize a download slot.
                         val ytFallbackStartMs = android.os.SystemClock.elapsedRealtime()
                         val ytResolveBudgetMs = 60_000L
                         val candidateTracks = linkedMapOf<String, YouTubeMusicTrack>()
@@ -1472,26 +1501,6 @@ class TrackDownloadManager @Inject constructor(
                     }
                 }
 
-                // 3. Proactively start lyrics lookup concurrently with the download
-                val shouldDownloadLyrics = runCatching {
-                    settingsPreferences.settings.first().downloadLyrics
-                }.getOrDefault(true)
-
-                val lyricsDeferred = if (shouldDownloadLyrics) {
-                    async(Dispatchers.IO) {
-                        runCatching {
-                            lyricsRepository.getLyrics(
-                                title = finalTitle,
-                                artist = finalArtist,
-                                album = resolvedAlbum,
-                                durationSeconds = null,
-                            )
-                        }.getOrNull()
-                    }
-                } else {
-                    null
-                }
-
                     val downloadedFile = tempDownloadFile ?: throw IOException("Downloaded file is missing")
                     var currentAudioFile = downloadedFile
 
@@ -1610,24 +1619,14 @@ class TrackDownloadManager @Inject constructor(
                         runCatching { durationRetriever.release() }
                     }
 
-                    // 5. Complete lyrics resolution (using concurrent result or duration-assisted fallback)
+                    // Optional enrichment gets a bounded finishing budget; never start another provider waterfall here.
                     var hasLyrics = false
                     var syncedLyrics: String? = null
                     var plainLyrics: String? = null
                     var lrcPath: String? = null
 
                     if (shouldDownloadLyrics) {
-                        var lyricsRecord = lyricsDeferred?.await()
-                        if (lyricsRecord !is LyricsResult.Success && durationMs > 0) {
-                            lyricsRecord = runCatching {
-                                lyricsRepository.getLyrics(
-                                    title = finalTitle,
-                                    artist = finalArtist,
-                                    album = resolvedAlbum,
-                                    durationSeconds = (durationMs / 1000).toInt(),
-                                )
-                            }.getOrNull()
-                        }
+                        val lyricsRecord = awaitOptionalDownloadResult(lyricsDeferred, 1_500L)
 
                         if (lyricsRecord is LyricsResult.Success) {
                             val lyrics = lyricsRecord
@@ -1646,7 +1645,7 @@ class TrackDownloadManager @Inject constructor(
                     if (resolvedArtworkUrl == null) {
                         // await() outside runCatching used to fail the whole
                         // download when the artwork fetch itself threw.
-                        resolvedArtworkUrl = runCatching { artworkFallback?.await() }.getOrNull()
+                        resolvedArtworkUrl = awaitOptionalDownloadResult(artworkFallback, 500L)
                     } else {
                         artworkFallback?.cancel()
                     }
@@ -2637,6 +2636,7 @@ class TrackDownloadManager @Inject constructor(
     }.getOrDefault(false)
 
     private fun updateProgress(progress: DownloadProgress) {
+        if (progress.isFinished && progress.error == null) retryRequests.remove(progress.key)
         _downloads.update { it + (progress.key to progress) }
     }
 
@@ -3084,11 +3084,12 @@ class TrackDownloadManager @Inject constructor(
     }
 
     /** Queued worker cancelled before it acquired a download slot. */
-    private fun forgetDownloadKey(key: String) {
+    private fun forgetDownloadKey(key: String, keepResult: Boolean = false) {
         activeKeys.remove(key)
         activeJobs.remove(key)
         reconnectGenerations.remove(key)
-        _downloads.update { it - key }
+        if (!keepResult) _downloads.update { it - key }
+        if (!keepResult || _downloads.value[key] == null) retryRequests.remove(key)
     }
 
     /** Worker that already holds a slot must release it exactly once. */

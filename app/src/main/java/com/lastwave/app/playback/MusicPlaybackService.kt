@@ -258,7 +258,7 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
                     publishNotification(state)
                     publishWidget(state)
                     publishCarBrowseState(state)
-                    detectTransition(state)
+                    if (state.current?.concertSegments.isNullOrEmpty()) detectTransition(state)
                     themeRepository.updateNowPlayingArtwork(state.current?.title, state.current?.artist)
                 }
         }
@@ -616,9 +616,11 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
     }
 
     private fun detectTransition(state: MusicPlayerState) {
-        val track = state.current ?: return
-        val (cleanTitle, cleanArtist) = cleanTrackMetadata(track.title, track.artist)
-        val key = "${cleanArtist.lowercase()}|${cleanTitle.lowercase()}"
+        val track = state.current
+        val key = track?.let {
+            val (cleanTitle, cleanArtist) = cleanTrackMetadata(it.title, it.artist)
+            "${state.listeningSessionKey.orEmpty()}|${cleanArtist.lowercase()}|${cleanTitle.lowercase()}|${it.videoId.orEmpty()}"
+        }.orEmpty()
         if (key == detectedKey) {
             if (state.isPlaying && key != nowPlayingAnnouncedKey) {
                 announceNowPlaying(state)
@@ -628,7 +630,8 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
 
         // If previous track reached threshold before transition but wasn't submitted yet, submit now
         val prev = pendingPreviousTrack
-        if (prev != null && !submissionAttempted && accumulatedMs >= 30_000L) {
+        val previousThreshold = minOf((prev?.durationMs?.takeIf { it > 0 } ?: 180_000L) * settings.scrobblePercent.coerceIn(25, 90) / 100, 240_000L).coerceAtLeast(30_000L)
+        if (prev != null && !submissionAttempted && accumulatedMs >= previousThreshold) {
             val (prevTitle, prevArtist) = cleanTrackMetadata(prev.title, prev.artist)
             val prevStartedAt = pendingPreviousStartedAt
             scope.launch(Dispatchers.IO) {
@@ -669,7 +672,7 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
         // all fire once the cooldown clears.
         if (nowPlayingInFlight) return
         val (cleanTitle, cleanArtist) = cleanTrackMetadata(track.title, track.artist)
-        val key = "${cleanArtist.lowercase()}|${cleanTitle.lowercase()}"
+        val key = "${state.listeningSessionKey.orEmpty()}|${cleanArtist.lowercase()}|${cleanTitle.lowercase()}|${track.videoId.orEmpty()}"
         nowPlayingAnnouncedKey = key
         nowPlayingInFlight = true
         scope.launch(Dispatchers.IO) {
@@ -703,9 +706,14 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
         detectorJob?.cancel()
         detectorJob = scope.launch {
             var wasPlaying = false
+            var lastSampleMs = android.os.SystemClock.elapsedRealtime()
             while (true) {
                 delay(1_000)
-                val state = musicPlayer.state.value
+                val now = android.os.SystemClock.elapsedRealtime()
+                val elapsedMs = (now - lastSampleMs).coerceIn(0L, 2_000L)
+                lastSampleMs = now
+                val state = concertListeningState(musicPlayer.state.value)
+                detectTransition(state)
                 val track = state.current
 
                 if (track == null) {
@@ -714,15 +722,16 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
                 }
 
                 val (cleanTitle, cleanArtist) = cleanTrackMetadata(track.title, track.artist)
-                val key = "${cleanArtist.lowercase()}|${cleanTitle.lowercase()}"
+                val key = "${state.listeningSessionKey.orEmpty()}|${cleanArtist.lowercase()}|${cleanTitle.lowercase()}|${track.videoId.orEmpty()}"
 
                 // Announce Now Playing when transitioning to playing or if not yet announced
                 if (state.isPlaying && (!wasPlaying || key != nowPlayingAnnouncedKey)) {
                     announceNowPlaying(state)
                 }
-                wasPlaying = state.isPlaying
-
-                if (!state.isPlaying) continue
+                val advancing = state.isPlaying && !state.isBuffering
+                val previouslyPlaying = wasPlaying
+                wasPlaying = advancing
+                val positionDelta = state.positionMs - lastPositionMs
 
                 // Check for track replay / restart
                 if (state.positionMs in 1..4_000 && lastPositionMs > 20_000L && accumulatedMs > 15_000L) {
@@ -734,7 +743,11 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
                 }
                 lastPositionMs = state.positionMs
 
-                accumulatedMs += 1_000
+                if (advancing && previouslyPlaying && positionDelta in 1..2_500 && positionDelta <= elapsedMs + 500L) {
+                    accumulatedMs += minOf(positionDelta, elapsedMs)
+                }
+
+                if (!advancing) continue
 
                 if (submissionAttempted) continue
 

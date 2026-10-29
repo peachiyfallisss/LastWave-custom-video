@@ -25,12 +25,21 @@ data class ConcertSongSegment(
 
 /** One full external/device video, with zero or more YouTube song mappings. */
 @Serializable
+data class ConcertSongLink(
+    val title: String,
+    val artist: String,
+    val youtubeVideoId: String,
+    val artworkUrl: String? = null,
+)
+
+@Serializable
 data class ConcertVideo(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
     val source: String,
     val segments: List<ConcertSongSegment> = emptyList(),
     val createdAtMillis: Long = System.currentTimeMillis(),
+    val wholeVideoSong: ConcertSongLink? = null,
 )
 
 @Singleton
@@ -40,11 +49,12 @@ class ConcertVideoRepository @Inject constructor(
     private val preferences = context.getSharedPreferences("lastwave_concert_videos", Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true }
 
-    fun all(): List<ConcertVideo> = runCatching {
-        json.decodeFromString<List<ConcertVideo>>(preferences.getString(KEY, null).orEmpty())
-            .sortedByDescending(ConcertVideo::createdAtMillis)
-    }.getOrDefault(emptyList())
+    @Synchronized
+    fun all(): List<ConcertVideo> = preferences.getString(KEY, null)?.let {
+        json.decodeFromString<List<ConcertVideo>>(it).sortedByDescending(ConcertVideo::createdAtMillis)
+    } ?: emptyList()
 
+    @Synchronized
     fun save(title: String, source: String, existingId: String? = null): ConcertVideo {
         val cleanTitle = title.trim()
         val cleanSource = source.trim()
@@ -55,21 +65,30 @@ class ConcertVideoRepository @Inject constructor(
         }
         val current = all()
         val existing = current.firstOrNull { it.id == existingId }
+        require(existingId == null || existing != null) { "This recording no longer exists." }
+        require(existing == null || existing.source == cleanSource || existing.segments.isEmpty()) {
+            "Remove the song mappings before replacing their source video."
+        }
         val saved = existing?.copy(title = cleanTitle, source = cleanSource)
             ?: ConcertVideo(title = cleanTitle, source = cleanSource)
         persist(if (existing == null) current + saved else current.map { if (it.id == saved.id) saved else it })
         return saved
     }
 
+    @Synchronized
     fun addSegment(concertId: String, segment: ConcertSongSegment): ConcertVideo? {
         require(segment.youtubeVideoId.matches(YOUTUBE_ID)) { "Choose a YouTube song result first." }
         require(segment.startMs >= 0L && segment.endMs > segment.startMs) { "The end time must be after the start time." }
         val concert = all().firstOrNull { it.id == concertId } ?: return null
+        require(concert.segments.none { it.id != segment.id && segment.startMs < it.endMs && it.startMs < segment.endMs }) {
+            "Song segments cannot overlap. Remove or adjust the existing range first."
+        }
         val updated = concert.copy(segments = (concert.segments.filterNot { it.id == segment.id } + segment).sortedBy { it.startMs })
         persist(all().map { if (it.id == concertId) updated else it })
         return updated
     }
 
+    @Synchronized
     fun removeSegment(concertId: String, segmentId: String): ConcertVideo? {
         val concert = all().firstOrNull { it.id == concertId } ?: return null
         val updated = concert.copy(segments = concert.segments.filterNot { it.id == segmentId })
@@ -77,7 +96,18 @@ class ConcertVideoRepository @Inject constructor(
         return updated
     }
 
+    @Synchronized
     fun delete(concertId: String) = persist(all().filterNot { it.id == concertId })
+
+    @Synchronized
+    fun linkWholeVideo(concertId: String, song: ConcertSongLink?): ConcertVideo? {
+        require(song == null || song.youtubeVideoId.matches(YOUTUBE_ID)) { "Choose a YouTube song result first." }
+        val current = all()
+        val concert = current.firstOrNull { it.id == concertId } ?: return null
+        val updated = concert.copy(wholeVideoSong = song)
+        persist(current.map { if (it.id == concertId) updated else it })
+        return updated
+    }
 
     private fun persist(concerts: List<ConcertVideo>) {
         check(preferences.edit().putString(KEY, json.encodeToString(concerts)).commit()) {
@@ -97,9 +127,11 @@ fun parseConcertTimestampMs(value: String): Long? {
     if (parts.size !in 2..3 || parts.any { it.isBlank() || it.toLongOrNull() == null }) return null
     val numbers = parts.map(String::toLong)
     if (numbers.any { it < 0L } || numbers.drop(1).any { it >= 60L }) return null
-    val seconds = when (numbers.size) {
-        2 -> numbers[0] * 60L + numbers[1]
-        else -> numbers[0] * 3_600L + numbers[1] * 60L + numbers[2]
-    }
-    return seconds * 1_000L
+    return runCatching {
+        val seconds = when (numbers.size) {
+            2 -> Math.addExact(Math.multiplyExact(numbers[0], 60L), numbers[1])
+            else -> Math.addExact(Math.addExact(Math.multiplyExact(numbers[0], 3_600L), numbers[1] * 60L), numbers[2])
+        }
+        Math.multiplyExact(seconds, 1_000L)
+    }.getOrNull()
 }

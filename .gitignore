@@ -59,6 +59,8 @@ app/src/main/assets/modules/
 tools/*
 !tools/generate_native_secrets.py
 !tools/test-recording-identity.sh
+!tools/test-feature-core.ps1
+!tools/CheckKotlinSyntax.java
 provider.js
 # Single raw provider source at repo base only (plaintext JSON, encrypted at build)
 provider.json

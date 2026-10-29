@@ -53,6 +53,7 @@ data class LyricLine(
     val syllables: List<LyricSyllable> = emptyList(),
     val transliteration: String? = null,
     val transliterationSyllables: List<LyricSyllable> = emptyList(),
+    val translation: String? = null,
 ) {
     val hasSyllables: Boolean get() = syllables.isNotEmpty()
     val isRtl: Boolean get() = isRtlText(text) || syllables.any { isRtlText(it.text) }
@@ -66,6 +67,7 @@ sealed interface LyricsResult {
         val plainLyrics: String? = null,
         val isInstrumental: Boolean = false,
         val source: String? = null,
+        val isCustom: Boolean = false,
     ) : LyricsResult {
         val isRtl: Boolean get() = lines.any { it.isRtl } || isRtlText(plainLyrics)
     }
@@ -708,8 +710,8 @@ class LyricsRepository @Inject constructor(
             return true
         }
 
-        private val TIMESTAMP_REGEX = Regex("""\[(\d{1,2}):(\d{2})(?:[.:](\d{2,3}))?\]""")
-        private val WORD_STAMP_REGEX = Regex("""<(\d{1,3}):(\d{2})[.:](\d{2,3})>""")
+        private val TIMESTAMP_REGEX = Regex("""\[(\d{1,4}):([0-5]\d)(?:[.:](\d{1,3}))?\]""")
+        private val WORD_STAMP_REGEX = Regex("""<(\d{1,4}):([0-5]\d)[.:](\d{1,3})>""")
         private val OFFSET_REGEX = Regex("""\[offset:\s*([+-]?\d+)\s*\]""", RegexOption.IGNORE_CASE)
         /**
          * Backing vocals in LRC have no role markup — convention is a fully

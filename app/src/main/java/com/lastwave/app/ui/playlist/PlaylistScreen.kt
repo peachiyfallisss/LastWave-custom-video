@@ -195,12 +195,6 @@ fun PlaylistScreen(
                         ) {
                             Icon(Icons.Filled.Add, contentDescription = "Create custom playlist")
                         }
-                        IconButton(
-                            onClick = { showConcertLibrary = true },
-                            modifier = Modifier.size(40.dp),
-                        ) {
-                            Icon(Icons.Filled.VideoLibrary, contentDescription = "Concert videos")
-                        }
                         Box {
                             Surface(
                                 onClick = { sortMenuExpanded = true },
@@ -247,6 +241,11 @@ fun PlaylistScreen(
                 },
             )
 
+            TextButton(onClick = { showConcertLibrary = true }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                Icon(Icons.Filled.VideoLibrary, null)
+                Spacer(Modifier.width(10.dp))
+                Text("Concert library · recordings & setlists")
+            }
             Box(
                 modifier = Modifier
                     .fillMaxSize()

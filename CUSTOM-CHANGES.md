@@ -1,5 +1,16 @@
 # LastWave custom video prototype
 
+## Concert/download UI and custom lyrics rework — source only
+
+The local `feat/custom-lyrics-translations` branch replaces the concert dialog
+with a full-screen preview/setlist workflow, adds an explicit download queue
+with failure/retry views, and introduces a tabbed per-recording lyrics/timing/
+translation editor. Full-concert listening attribution now follows mapped
+segments without reopening the video. Optional download enrichment is bounded.
+See [implementation and validation notes](docs/concert-and-lyrics-rework.md).
+This rework has not produced a new APK or completed Android/device validation;
+the existing APKs/releases below do not contain it.
+
 Prepared from Clash-Projects/LastWave-Native commit `97c68d5ace29da2363023e3f3d7723859a7061a0`.
 
 This is modified source for a custom debug APK. No upstream repository or account was changed.

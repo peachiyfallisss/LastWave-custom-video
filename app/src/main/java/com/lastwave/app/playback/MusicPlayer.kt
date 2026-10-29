@@ -122,6 +122,8 @@ data class PlayableTrack(
     val videoSourceUrl: String? = null,
     val videoSegmentStartMs: Long? = null,
     val videoSegmentEndMs: Long? = null,
+    val concertId: String? = null,
+    val concertSegments: List<com.lastwave.app.data.video.ConcertSongSegment> = emptyList(),
 )
 
 @Serializable
@@ -173,6 +175,8 @@ data class MusicPlayerState(
     val error: String? = null,
     /** Changes source without opening a new listening session for this song. */
     val sourceSwitchSerial: Long = 0L,
+    /** Attribution session only; never used to reopen or replace the playing media. */
+    val listeningSessionKey: String? = null,
 )
 
 /**

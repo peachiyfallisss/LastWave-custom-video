@@ -1,328 +1,357 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
 package com.lastwave.app.ui.playlist
 
 import android.content.Intent
+import android.provider.OpenableColumns
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.VideoLibrary
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Divider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.AsyncImage
 import com.lastwave.app.data.music.YouTubeMusicTrack
-import com.lastwave.app.data.video.ConcertVideo
-import com.lastwave.app.data.video.parseConcertTimestampMs
+import com.lastwave.app.data.video.*
+import com.lastwave.app.ui.player.TrackVideoSurface
+import kotlinx.coroutines.delay
 import java.net.URI
+import java.util.Locale
 
+/** Full-screen library with a single scrolling surface and focused editing sheets. */
 @Composable
-fun ConcertLibraryDialog(
-    onDismiss: () -> Unit,
-    viewModel: ConcertLibraryViewModel = hiltViewModel(),
-) {
+fun ConcertLibraryDialog(onDismiss: () -> Unit, viewModel: ConcertLibraryViewModel = hiltViewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    var showAddDialog by remember { mutableStateOf(false) }
-    var selectedConcertId by remember { mutableStateOf<String?>(null) }
-    var selectedSong by remember { mutableStateOf<YouTubeMusicTrack?>(null) }
-    var confirmDeleteId by remember { mutableStateOf<String?>(null) }
-    var query by remember { mutableStateOf("") }
-    var startText by remember { mutableStateOf("") }
-    var endText by remember { mutableStateOf("") }
-
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(
-            modifier = Modifier.fillMaxWidth().fillMaxHeight(0.94f).padding(horizontal = 10.dp, vertical = 8.dp),
-            shape = RoundedCornerShape(28.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp,
-        ) {
-            Column(Modifier.fillMaxWidth().padding(18.dp)) {
-                val concert = state.recordings.firstOrNull { it.id == selectedConcertId }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (concert != null) {
-                        IconButton(onClick = {
-                            selectedConcertId = null
-                            selectedSong = null
-                            query = ""
-                            viewModel.dismissMessage()
-                        }) { Icon(Icons.Filled.ArrowBack, contentDescription = "Back to concert videos") }
-                    } else {
-                        Icon(Icons.Filled.VideoLibrary, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(concert?.title ?: "Concert videos", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(
-                            if (concert == null) "Add a full video, then link song timestamps" else "${concert.segments.size} linked song segments",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
+    var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
+    var importing by remember { mutableStateOf(false) }
+    var editingRecording by remember { mutableStateOf<ConcertVideo?>(null) }
+    var mapping by remember { mutableStateOf(false) }
+    var editingSegment by remember { mutableStateOf<ConcertSongSegment?>(null) }
+    var deleting by remember { mutableStateOf<ConcertVideo?>(null) }
+    var deletingSegment by remember { mutableStateOf<ConcertSongSegment?>(null) }
+    val concert = state.recordings.firstOrNull { it.id == selectedId }
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(state.message) {
+        state.message?.let { snackbar.showSnackbar(it); viewModel.dismissMessage() }
+    }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        BackHandler(enabled = selectedId != null && !mapping) { selectedId = null }
+        Scaffold(
+            topBar = {
+                TopAppBar(title = { Text(concert?.title ?: "Concerts", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    navigationIcon = { IconButton(onClick = { if (concert == null) onDismiss() else selectedId = null }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                    } }, actions = {
+                        if (concert != null) IconButton(onClick = { editingRecording = concert }) { Icon(Icons.Filled.Edit, "Edit recording") }
+                    })
+            },
+            snackbarHost = { SnackbarHost(snackbar) },
+            floatingActionButton = {
+                ExtendedFloatingActionButton(
+                    onClick = { if (concert == null) importing = true else { editingSegment = null; mapping = true; viewModel.dismissMessage() } },
+                    icon = { Icon(Icons.Filled.Add, null) }, text = { Text(if (concert == null) "Add recording" else "Link a song") },
+                )
+            },
+        ) { insets ->
+            Box(Modifier.fillMaxSize().padding(insets), contentAlignment = Alignment.TopCenter) {
+                LazyColumn(Modifier.widthIn(max = 840.dp).fillMaxSize(),
+                    contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 112.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     if (concert == null) {
-                        TextButton(onClick = { showAddDialog = true }) { Text("Add video") }
-                    }
-                    IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, contentDescription = "Close") }
-                }
-                Spacer(Modifier.height(12.dp))
-                Divider()
-                Spacer(Modifier.height(12.dp))
-
-                if (concert == null) {
-                    if (state.recordings.isEmpty()) {
-                        Column(Modifier.fillMaxWidth().weight(1f), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                            Text("No concert videos yet", style = MaterialTheme.typography.titleMedium)
-                            Spacer(Modifier.height(8.dp))
-                            Text("Add a Bilibili link or choose a video file from this device.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Spacer(Modifier.height(16.dp))
-                            Button(onClick = { showAddDialog = true }) { Text("Add concert video") }
+                        item {
+                            Text("Your recordings, one library.", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                            Text("Import a video. Build its setlist. Watch the whole show.",
+                                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 8.dp, bottom = 8.dp))
+                        }
+                        if (state.recordings.isEmpty()) item {
+                            ElevatedCard(Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Icon(Icons.Filled.VideoLibrary, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
+                                    Text("Add your first concert", style = MaterialTheme.typography.titleLarge)
+                                    Text("Use a video on your device, a public Bilibili or YouTube recording, or a direct video link.")
+                                    Button(onClick = { importing = true }) { Text("Choose a recording") }
+                                }
+                            }
+                        }
+                        items(state.recordings, key = { it.id }) { recording ->
+                            RecordingCard(recording, onOpen = { selectedId = recording.id },
+                                onPlay = { selectedId = recording.id; viewModel.playFull(recording) },
+                                onDelete = { deleting = recording })
                         }
                     } else {
-                        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.weight(1f)) {
-                            items(state.recordings, key = ConcertVideo::id) { recording ->
-                                ConcertRecordingCard(
-                                    recording = recording,
-                                    onOpen = { selectedConcertId = recording.id; viewModel.dismissMessage() },
-                                    onPlay = { viewModel.playFull(recording) },
-                                    onPlayMapped = { viewModel.playMappedSegments(recording) },
-                                    onDelete = { confirmDeleteId = recording.id },
-                                )
-                            }
-                        }
-                    }
-                } else {
-                    Text(
-                        concert.source,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        "Play full video keeps the whole show intact. Play linked songs to play the saved ranges under their YouTube song identities for scrobbles/history.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        OutlinedTextField(
-                            value = query,
-                            onValueChange = { query = it },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            label = { Text("Search YouTube songs") },
-                        )
-                        IconButton(
-                            onClick = { viewModel.searchSongs(query); selectedSong = null },
-                            enabled = query.isNotBlank() && !state.isSearching,
-                            modifier = Modifier.align(Alignment.CenterVertically),
-                        ) {
-                            if (state.isSearching) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                            else Icon(Icons.Filled.Search, contentDescription = "Search YouTube songs")
-                        }
-                    }
-                    selectedSong?.let { song ->
-                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
-                            Column(Modifier.fillMaxWidth().padding(12.dp)) {
-                                Text("Selected: ${song.title}", fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(song.artist, style = MaterialTheme.typography.bodySmall)
-                                Spacer(Modifier.height(8.dp))
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    OutlinedTextField(value = startText, onValueChange = { startText = it }, modifier = Modifier.weight(1f), singleLine = true, label = { Text("Start (h:mm:ss)") }, placeholder = { Text("1:35:54") })
-                                    OutlinedTextField(value = endText, onValueChange = { endText = it }, modifier = Modifier.weight(1f), singleLine = true, label = { Text("End (h:mm:ss)") }, placeholder = { Text("1:38:20") })
+                        item { ConcertPreview(concert, viewModel, showVideo = !mapping) }
+                        item {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("Setlist", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                                    Text("${concert.segments.size} linked songs · ${sourceLabel(concert.source)}",
+                                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
-                                Spacer(Modifier.height(8.dp))
-                                Button(onClick = {
-                                    viewModel.addSegment(concert.id, song, startText, endText)
-                                    val start = parseConcertTimestampMs(startText)
-                                    val end = parseConcertTimestampMs(endText)
-                                    if (start != null && end != null && end > start) {
-                                        selectedSong = null
-                                        startText = ""
-                                        endText = ""
-                                    }
-                                }) { Text("Link this segment") }
+                                if (concert.segments.isNotEmpty()) TextButton(onClick = { viewModel.playMappedSegments(concert) }) { Text("Songs only") }
                             }
                         }
-                        Spacer(Modifier.height(8.dp))
-                    }
-                    if (state.searchResults.isNotEmpty()) {
-                        Text("Choose the matching YouTube song", style = MaterialTheme.typography.labelLarge)
-                        LazyColumn(Modifier.heightIn(max = 210.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            items(state.searchResults, key = YouTubeMusicTrack::videoId) { song ->
-                                TextButton(onClick = { selectedSong = song }) {
-                                    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
-                                        Text(song.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Text(song.artist, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (concert.segments.isEmpty()) item {
+                            OutlinedCard(Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text("What’s being performed?", style = MaterialTheme.typography.titleMedium)
+                                    Text("Link each song to its place in the recording. You can mark the start and end from the playing video.",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    TextButton(onClick = { mapping = true; editingSegment = null }) { Text("Link first song") }
+                                }
+                            }
+                        }
+                        items(concert.segments, key = { it.id }) { segment ->
+                            OutlinedCard(onClick = { editingSegment = segment; mapping = true }, modifier = Modifier.fillMaxWidth()) {
+                                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Text("${formatConcertTime(segment.startMs)} — ${formatConcertTime(segment.endMs)}",
+                                            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                                        Text(segment.title, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                        Text(segment.artist, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Text("${formatConcertTime(segment.endMs - segment.startMs)} · Tap to edit", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                    IconButton(onClick = { viewModel.previewSegment(concert, segment) }) { Icon(Icons.Filled.PlayArrow, "Play ${segment.title}") }
+                                    IconButton(onClick = { deletingSegment = segment }) { Icon(Icons.Filled.DeleteOutline, "Remove ${segment.title}") }
+                                }
+                            }
+                        }
+                        item {
+                            concert.wholeVideoSong?.let { song ->
+                                OutlinedCard(Modifier.fillMaxWidth()) {
+                                    Column(Modifier.padding(16.dp)) {
+                                        Text("Whole-recording link", style = MaterialTheme.typography.labelLarge)
+                                        Text("${song.artist} — ${song.title}")
+                                        Text("Used only when the setlist is empty.", style = MaterialTheme.typography.bodySmall)
+                                        TextButton(onClick = { viewModel.linkWholeVideo(concert.id, null) }) { Text("Remove link") }
                                     }
                                 }
                             }
                         }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text("Song segments", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    if (concert.segments.isEmpty()) {
-                        Text("Search for a song and set its start and end time in the concert.", modifier = Modifier.padding(top = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    } else {
-                        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            items(concert.segments, key = { it.id }) { segment ->
-                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text(segment.title, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Text("${segment.artist}  ·  ${formatConcertTime(segment.startMs)}–${formatConcertTime(segment.endMs)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                    IconButton(onClick = { viewModel.removeSegment(concert.id, segment.id) }) {
-                                        Icon(Icons.Filled.Delete, contentDescription = "Remove ${segment.title}")
-                                    }
-                                }
-                                Divider()
-                            }
+                        item {
+                            Text("Full-show playback changes song attribution at each mapped range without reopening the video. Unmapped sections receive no song credit. History/scrobbling uses your normal account settings and listening thresholds; YouTube controls badge eligibility.",
+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
-                    Spacer(Modifier.height(6.dp))
-                    Button(onClick = { viewModel.playMappedSegments(concert) }, enabled = concert.segments.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("Play mapped songs")
-                    }
-                }
-
-                state.message?.let { message ->
-                    Spacer(Modifier.height(8.dp))
-                    Text(message, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
-    }
-
-    if (showAddDialog) AddConcertVideoDialog(
-        onDismiss = { showAddDialog = false },
-        onSave = { title, source -> viewModel.saveRecording(title, source); showAddDialog = false },
-    )
-    confirmDeleteId?.let { id ->
-        val deleting = state.recordings.firstOrNull { it.id == id }
-        AlertDialog(
-            onDismissRequest = { confirmDeleteId = null },
-            title = { Text("Delete concert video?") },
-            text = { Text("${deleting?.title ?: "This recording"} and its linked song ranges will be removed.") },
-            confirmButton = { TextButton(onClick = { viewModel.deleteRecording(id); confirmDeleteId = null }) { Text("Delete") } },
-            dismissButton = { TextButton(onClick = { confirmDeleteId = null }) { Text("Cancel") } },
-        )
+        if (importing || editingRecording != null) RecordingEditor(editingRecording,
+            onDismiss = { importing = false; editingRecording = null },
+            onSave = { name, source -> viewModel.saveRecording(name, source, editingRecording?.id) { importing = false; editingRecording = null } },
+            error = state.message, busy = state.isSaving)
+        if (mapping && concert != null) SongMappingSheet(concert, editingSegment, viewModel,
+            onDismiss = { mapping = false; editingSegment = null })
+        deleting?.let { target -> AlertDialog(onDismissRequest = { deleting = null }, title = { Text("Remove recording?") },
+            text = { Text("${target.title} and its song links will leave this library. The original video will not be deleted.") },
+            confirmButton = { TextButton(onClick = { viewModel.deleteRecording(target.id); deleting = null }) { Text("Remove") } },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text("Keep") } }) }
+        deletingSegment?.let { target -> AlertDialog(onDismissRequest = { deletingSegment = null }, title = { Text("Remove song link?") },
+            text = { Text("Remove ${target.title} from this setlist? The recording is kept.") },
+            confirmButton = { TextButton(onClick = { concert?.let { viewModel.removeSegment(it.id, target.id) }; deletingSegment = null }) { Text("Remove") } },
+            dismissButton = { TextButton(onClick = { deletingSegment = null }) { Text("Keep") } }) }
     }
 }
 
 @Composable
-private fun ConcertRecordingCard(
-    recording: ConcertVideo,
-    onOpen: () -> Unit,
-    onPlay: () -> Unit,
-    onPlayMapped: () -> Unit,
-    onDelete: () -> Unit,
-) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
-        Column(Modifier.fillMaxWidth().padding(14.dp)) {
-            Text(recording.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Text("${recording.segments.size} song links  ·  ${sourceLabel(recording.source)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = onPlay) { Icon(Icons.Filled.PlayArrow, null); Text("Play full video") }
-                TextButton(onClick = onOpen) { Text("Link songs") }
-                if (recording.segments.isNotEmpty()) TextButton(onClick = onPlayMapped) { Text("Play setlist") }
-                Spacer(Modifier.weight(1f))
-                IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, contentDescription = "Delete concert video", tint = MaterialTheme.colorScheme.error) }
+private fun RecordingCard(recording: ConcertVideo, onOpen: () -> Unit, onPlay: () -> Unit, onDelete: () -> Unit) {
+    ElevatedCard(onClick = onOpen, modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            Box(Modifier.size(72.dp).clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.primaryContainer), contentAlignment = Alignment.Center) {
+                val art = recording.segments.firstOrNull()?.artworkUrl ?: recording.wholeVideoSong?.artworkUrl
+                if (art == null) Icon(Icons.Filled.VideoLibrary, null, Modifier.size(32.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                else AsyncImage(art, null, Modifier.fillMaxSize(), contentScale = androidx.compose.ui.layout.ContentScale.Crop)
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(recording.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(sourceLabel(recording.source), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("${recording.segments.size} song links", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            }
+            Column {
+                IconButton(onClick = onPlay) { Icon(Icons.Filled.PlayArrow, "Play ${recording.title}") }
+                IconButton(onClick = onDelete) { Icon(Icons.Filled.DeleteOutline, "Remove ${recording.title}") }
             }
         }
     }
 }
 
 @Composable
-private fun AddConcertVideoDialog(onDismiss: () -> Unit, onSave: (String, String) -> Unit) {
+private fun ConcertPreview(concert: ConcertVideo, viewModel: ConcertLibraryViewModel, showVideo: Boolean = true) {
+    val player = viewModel.musicPlayer
+    val mode by player.videoState.collectAsStateWithLifecycle()
+    val playback by player.chromeState.collectAsStateWithLifecycle()
+    val progress by player.progressState.collectAsStateWithLifecycle()
+    val active = mode.source == concert.source && mode.enabled
+    val pending = mode.loading && playback.current?.videoSourceUrl == concert.source
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(20.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest), contentAlignment = Alignment.Center) {
+            if (active && showVideo) TrackVideoSurface(player, playback.isPlaying, Modifier.fillMaxSize())
+            else Icon(Icons.Filled.Movie, null, Modifier.size(52.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (!active && !pending) FilledIconButton(onClick = { viewModel.playFull(concert) }, modifier = Modifier.size(64.dp)) {
+                Icon(Icons.Filled.PlayArrow, "Play full concert", Modifier.size(36.dp))
+            }
+            if (pending) CircularProgressIndicator()
+        }
+        if (active) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                IconButton(onClick = { player.togglePlayPause() }) { Icon(if (playback.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow, "Play/pause") }
+                Slider(value = progress.positionMs.toFloat().coerceIn(0f, progress.durationMs.coerceAtLeast(1).toFloat()),
+                    onValueChange = { player.seekTo(it.toLong()) }, valueRange = 0f..progress.durationMs.coerceAtLeast(1).toFloat(), modifier = Modifier.weight(1f))
+                Text(formatConcertTime(progress.positionMs + (mode.segmentStartMs ?: 0)), style = MaterialTheme.typography.labelMedium)
+            }
+            val currentSong = concert.segments.firstOrNull { (progress.positionMs + (mode.segmentStartMs ?: 0)) in it.startMs until it.endMs }
+            currentSong?.let { Text("Now linked: ${it.artist} — ${it.title}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
+        }
+        if (!active || mode.segmentStartMs != null) Button(enabled = !pending, onClick = { viewModel.playFull(concert) }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Filled.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text(if (active && mode.segmentStartMs != null) "Return to full show" else "Play full show")
+        }
+        if (active || playback.current?.videoSourceUrl == concert.source) mode.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    }
+}
+
+@Composable
+private fun RecordingEditor(existing: ConcertVideo?, onDismiss: () -> Unit, onSave: (String, String) -> Unit, error: String?, busy: Boolean) {
     val context = LocalContext.current
-    var title by remember { mutableStateOf("") }
-    var source by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf<String?>(null) }
+    var title by rememberSaveable(existing?.id) { mutableStateOf(existing?.title.orEmpty()) }
+    var source by rememberSaveable(existing?.id) { mutableStateOf(existing?.source.orEmpty()) }
+    var tab by rememberSaveable { mutableIntStateOf(if (source.startsWith("content:")) 0 else 1) }
+    var selectedName by remember { mutableStateOf(if (source.startsWith("content:")) "Device video selected" else "") }
+    var localError by remember { mutableStateOf<String?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
-            runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-            source = uri.toString()
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                    if (it.moveToFirst()) selectedName = it.getString(0).orEmpty()
+                }
+                source = uri.toString()
+                if (title.isBlank()) title = selectedName.substringBeforeLast('.').ifBlank { "Concert recording" }
+            }.onFailure { localError = "Could not keep access to this file. Choose it again." }
         }
     }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Add concert video") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(value = title, onValueChange = { title = it; error = null }, label = { Text("Concert name") }, singleLine = true)
-                OutlinedTextField(value = source, onValueChange = { source = it; error = null }, label = { Text("Video link (Bilibili, YouTube, direct link)") }, minLines = 2)
-                OutlinedButton(onClick = { picker.launch(arrayOf("video/*")) }, modifier = Modifier.fillMaxWidth()) { Text("Choose video from device") }
-                error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
-                Text("The recording is saved as one concert item. You can link each song to its YouTube Music match and timestamps.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text(if (existing == null) "Add recording" else "Edit recording", style = MaterialTheme.typography.headlineSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = tab == 0, onClick = { if (tab != 0) { tab = 0; source = "" } }, label = { Text("From device") })
+                FilterChip(selected = tab == 1, onClick = { if (tab != 1) { tab = 1; source = "" } }, label = { Text("Video link") })
             }
-        },
-        confirmButton = {
-            TextButton(onClick = {
+            if (tab == 0) {
+                OutlinedButton(onClick = { picker.launch(arrayOf("video/*")) }, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text(selectedName.ifBlank { "Choose video file" }, maxLines = 1)
+                }
+            } else OutlinedTextField(source, { source = it }, label = { Text("Bilibili, YouTube, or direct HTTPS link") }, modifier = Modifier.fillMaxWidth(), maxLines = 3)
+            OutlinedTextField(title, { title = it }, label = { Text("Recording name") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            (localError ?: error)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            Button(enabled = !busy, onClick = {
                 val uri = runCatching { URI(source.trim()) }.getOrNull()
-                if (title.isBlank()) error = "Enter a concert name."
-                else if (source.isBlank() || (uri?.scheme != "content" && uri?.scheme != "https")) error = "Choose a device video or paste an HTTPS link."
+                if (title.isBlank()) localError = "Give this recording a name."
+                else if (uri?.scheme != "content" && !(uri?.scheme == "https" && !uri.host.isNullOrBlank())) localError = "Choose a video or enter a valid HTTPS link."
                 else onSave(title, source)
-            }) { Text("Add") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
+            }, modifier = Modifier.fillMaxWidth()) { Text(if (existing == null) "Add to library" else "Save changes") }
+            Text("The original recording stays where it is. LastWave saves its source and your song links.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(8.dp))
+        }
+    }
 }
 
-private fun sourceLabel(source: String): String = when {
-    source.startsWith("content://") -> "device video"
-    else -> runCatching { URI(source).host?.removePrefix("www.") }.getOrNull() ?: "video link"
+@Composable
+private fun SongMappingSheet(concert: ConcertVideo, existing: ConcertSongSegment?, viewModel: ConcertLibraryViewModel, onDismiss: () -> Unit) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val previewMode by viewModel.musicPlayer.videoState.collectAsStateWithLifecycle()
+    val hasPlayhead = previewMode.enabled && previewMode.source == concert.source && !previewMode.loading
+    var song by remember { mutableStateOf(existing?.let { YouTubeMusicTrack(it.youtubeVideoId, it.title, it.artist, artworkUrl = it.artworkUrl) }) }
+    var query by rememberSaveable { mutableStateOf("") }
+    var start by rememberSaveable { mutableStateOf(existing?.startMs?.let(::formatConcertTime) ?: "0:00") }
+    var end by rememberSaveable { mutableStateOf(existing?.endMs?.let(::formatConcertTime).orEmpty()) }
+    var whole by rememberSaveable { mutableStateOf(false) }
+    val startMs = parseConcertTimestampMs(start)
+    val endMs = parseConcertTimestampMs(end)
+    val overlaps = startMs != null && endMs != null && concert.segments.any { it.id != existing?.id && startMs < it.endMs && it.startMs < endMs }
+    val valid = whole || (startMs != null && endMs != null && endMs > startMs && !overlaps)
+    LaunchedEffect(query) { delay(350); viewModel.searchSongs(query) }
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(Modifier.fillMaxWidth().fillMaxHeight(0.9f).imePadding().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(if (existing == null) "Link a song" else "Edit song link", style = MaterialTheme.typography.headlineSmall)
+            Text(if (song == null) "1 · Choose the matching song" else "2 · Set its place in the recording", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (song == null) {
+                OutlinedTextField(query, { query = it }, label = { Text("Search song and artist") }, leadingIcon = { Icon(Icons.Filled.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                if (state.isSearching) LinearProgressIndicator(Modifier.fillMaxWidth())
+                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (query.isBlank()) item { Text("Search for the song you want credited when this performance plays.", Modifier.padding(vertical = 16.dp)) }
+                    items(state.searchResults, key = { it.videoId }) { result ->
+                        OutlinedCard(onClick = { song = result; viewModel.dismissMessage() }, modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp)) {
+                                Text(result.title, fontWeight = FontWeight.SemiBold, maxLines = 2)
+                                Text(result.artist, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                    state.message?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
+                }
+            } else {
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ListItem(headlineContent = { Text(song!!.title) }, supportingContent = { Text(song!!.artist) },
+                        trailingContent = { TextButton(onClick = { song = null }) { Text("Change") } })
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(!whole, { whole = false }, label = { Text("Song segment") })
+                        if (existing == null) FilterChip(whole, { whole = true }, label = { Text("Entire video") })
+                    }
+                    if (whole) Text("Use this song for the entire video when the setlist is empty. For a multi-song concert, link separate segments instead.")
+                    else {
+                        ConcertPreview(concert, viewModel)
+                        OutlinedTextField(start, { start = it }, label = { Text("Start · m:ss or h:mm:ss") }, singleLine = true, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii))
+                        TextButton(enabled = hasPlayhead, onClick = { viewModel.sourcePosition(concert)?.let { start = formatConcertTime(it) } }) { Text("Use current playhead as start") }
+                        OutlinedTextField(end, { end = it }, label = { Text("End · m:ss or h:mm:ss") }, singleLine = true, modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii))
+                        TextButton(enabled = hasPlayhead, onClick = { viewModel.sourcePosition(concert)?.let { end = formatConcertTime(it) } }) { Text("Use current playhead as end") }
+                        if (overlaps) Text("This range overlaps another song. Adjust its start or end.", color = MaterialTheme.colorScheme.error)
+                        else if (valid) Text("Segment length · ${formatConcertTime(endMs!! - startMs!!)}", color = MaterialTheme.colorScheme.primary)
+                        else Text("End must be after start. Example: 1:35:54 → 1:38:20.", style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(enabled = valid, onClick = {
+                            viewModel.previewSegment(concert, ConcertSongSegment(title = song!!.title, artist = song!!.artist,
+                                youtubeVideoId = song!!.videoId, artworkUrl = song!!.artworkUrl, startMs = startMs!!, endMs = endMs!!))
+                        }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Filled.PlayArrow, null); Text("Preview this range") }
+                    }
+                    state.message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
+                Button(enabled = valid && !state.isSaving, onClick = {
+                    if (whole) viewModel.linkWholeVideo(concert.id, song, onDismiss)
+                    else viewModel.addSegment(concert.id, song!!, start, end, existing?.id, onDismiss)
+                }, modifier = Modifier.fillMaxWidth().navigationBarsPadding()) { Text(if (existing == null) "Save song link" else "Save changes") }
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+    }
 }
 
-private fun formatConcertTime(ms: Long): String {
-    val total = ms / 1_000L
-    val hours = total / 3_600L
-    val minutes = (total % 3_600L) / 60L
-    val seconds = total % 60L
-    return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, seconds) else "%d:%02d".format(minutes, seconds)
+private fun sourceLabel(source: String): String = if (source.startsWith("content://")) "On this device"
+    else runCatching { URI(source).host?.removePrefix("www.") }.getOrNull() ?: "Video link"
+
+internal fun formatConcertTime(ms: Long): String {
+    val total = ms.coerceAtLeast(0L) / 1_000L
+    return if (total >= 3_600L) "%d:%02d:%02d".format(Locale.ROOT, total / 3_600, total / 60 % 60, total % 60)
+    else "%d:%02d".format(Locale.ROOT, total / 60, total % 60)
 }
