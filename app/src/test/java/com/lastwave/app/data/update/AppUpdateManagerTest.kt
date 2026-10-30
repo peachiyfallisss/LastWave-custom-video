@@ -68,7 +68,10 @@ class AppUpdateManagerTest {
         every { pm.canRequestPackageInstalls() } returns false
     }
     @After fun cleanup() {
-        manager?.close()
+        manager?.let { owner ->
+            owner.close()
+            runBlocking { withTimeout(10_000) { owner.rootJob().join() } }
+        }
         Dispatchers.resetMain()
         unmockkAll()
     }
@@ -92,6 +95,10 @@ class AppUpdateManagerTest {
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("test").body(body).build()
         }.build()
         return AppUpdateManager(context, client).also { manager = it }
+    }
+    private fun AppUpdateManager.rootJob(): Job {
+        val field = AppUpdateManager::class.java.getDeclaredField("scope").apply { isAccessible = true }
+        return (field.get(this) as CoroutineScope).coroutineContext[Job]!!
     }
     private suspend fun AppUpdateManager.checked() = withTimeout(5_000) { updateInfo.first { !it.isChecking } }
 
@@ -131,11 +138,33 @@ class AppUpdateManagerTest {
             assertEquals(UpdateChannel.STABLE, state.channel)
             assertFalse(state.isUpdateAvailable)
         } finally { release.countDown() }
-        delay(100)
+        withTimeout(5_000) { manager.rootJob().children.toList().joinAll() }
         assertFalse(manager.updateInfo.value.readyToInstall)
         assertEquals(UpdateChannel.STABLE, manager.updateInfo.value.channel)
         verify(exactly = 0) { context.startActivity(any()) }
     }
+    @Test fun supersededArchiveValidationCannotDeleteSharedCachedApk() = runBlocking {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val cached = File(cache, "updates/${digest(payload)}.apk").apply { parentFile!!.mkdirs(); writeBytes(payload) }
+        every { pm.getPackageArchiveInfo(any<String>(), any<Int>()) } answers {
+            entered.countDown()
+            check(release.await(5, TimeUnit.SECONDS))
+            throw java.io.IOException("obsolete validation failed")
+        }
+        val manager = create()
+        manager.checked(); manager.openUpdate(context)
+        try {
+            assertTrue(withContext(Dispatchers.IO) { entered.await(5, TimeUnit.SECONDS) })
+            manager.selectChannel(UpdateChannel.TEST) // Same release, different preference generation.
+            manager.checked()
+        } finally { release.countDown() }
+        withTimeout(5_000) { manager.rootJob().children.toList().joinAll() }
+        assertTrue("Obsolete cleanup must not delete the current channel's cached APK", cached.isFile)
+        assertEquals(UpdateChannel.TEST, manager.updateInfo.value.channel)
+        verify(exactly = 0) { context.startActivity(any()) }
+    }
+
     @Test fun malformedOrForeignFeedsFailClosed() {
         val raw = feed()
         assertEquals(UpdateChannel.TEST, parseUpdateFeed(raw.toString()).activeChannel)

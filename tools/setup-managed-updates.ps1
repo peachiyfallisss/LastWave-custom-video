@@ -49,4 +49,3 @@ try {
     Write-Output 'Signing secrets configured. Private values were not committed or printed.'
     Write-Output "Local encrypted backup: $signing (password is Windows-account protected)."
 } finally { Remove-Item Env:LASTWAVE_KEY_PASSWORD -ErrorAction SilentlyContinue; $secure = $null }
-

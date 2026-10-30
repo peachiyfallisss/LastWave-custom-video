@@ -231,9 +231,13 @@ class AppUpdateManager @Inject constructor(
                 synchronized(lock) { if (token == generation) _updateInfo.update { it.copy(isDownloading = false, message = "Update download cancelled. Tap to retry.") } }
                 throw cancelled
             } catch (failure: Exception) {
-                file.delete()
-                synchronized(lock) { if (token == generation) _updateInfo.update { it.copy(isDownloading = false, readyToInstall = false,
-                    message = "Update not installed: ${failure.message ?: "try again"}") } }
+                synchronized(lock) { if (token == generation) {
+                    // A superseded channel may share this immutable cached APK.
+                    // Only the current generation can discard it after failure.
+                    file.delete()
+                    _updateInfo.update { it.copy(isDownloading = false, readyToInstall = false,
+                        message = "Update not installed: ${failure.message ?: "try again"}") }
+                } }
             } finally {
                 partial.delete()
                 synchronized(lock) { if (token == generation) downloadJob = null }
