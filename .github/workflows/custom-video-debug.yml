@@ -88,7 +88,7 @@ jobs:
         run: |
           apk=app/build/outputs/apk/debug/app-debug.apk
           apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)
-          "$apksigner" verify --verbose "$apk"
+          "$apksigner" verify --verbose --print-certs "$apk"
           "$(dirname "$apksigner")/aapt" dump badging "$apk" | grep -E '^(package:|sdkVersion:|targetSdkVersion:|native-code:)'
           expected_package=com.lastwave.app.custom
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then expected_package=com.lastwave.app.custom.rework; fi

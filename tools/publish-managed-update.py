@@ -22,6 +22,15 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def signer_fingerprints(output):
+    # apksigner uses either numbered signers or SDK-range labels for v3.1.
+    # A source-stamp certificate is not an APK signer. Every SDK-range signer
+    # must still be the same pinned identity; key rotation is not implicit.
+    return {digest.lower() for digest in re.findall(
+        r"^Signer(?: #[0-9]+| \(minSdkVersion=[^\r\n]*\)) certificate SHA-256 digest: ([a-fA-F0-9]{64})\s*$",
+        output, flags=re.MULTILINE)}
+
+
 def validate_release(item, channel):
     assert type(item["dataSchemaVersion"]) is int and item["dataSchemaVersion"] > 0
     code = item["versionCode"]
@@ -74,9 +83,9 @@ def prepare(args):
     assert package and minimum and package[1] == PACKAGE and int(package[2]) == args.code
     assert package[3].endswith(f"-{args.channel}.{args.code}")
     certs = run(args.apksigner, "verify", "--verbose", "--print-certs", args.apk)
-    fingerprints = re.findall(r"Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9]+)", certs)
+    fingerprints = signer_fingerprints(certs)
     pin = Path(args.pin).read_text().strip()
-    assert len(fingerprints) == 1 and fingerprints[0].lower() == pin, "APK does not use the permanent managed signing key"
+    assert fingerprints == {pin}, f"APK signer mismatch: expected {pin}, found {sorted(fingerprints)}"
     tag = f"managed-{args.channel}-{args.code}"
     database_source = Path("app/src/main/java/com/lastwave/app/data/local/db/AppDatabase.kt").read_text()
     schema = int(re.search(r"version\s*=\s*(\d+)", database_source)[1])
