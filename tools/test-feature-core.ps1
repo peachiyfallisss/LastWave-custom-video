@@ -13,7 +13,7 @@ function Read-Source($path) { (Get-Content -LiteralPath (Join-Path $repo $path) 
 try {
     & javac -cp "$KotlinLib\*" -d $temp (Join-Path $PSScriptRoot 'CheckKotlinSyntax.java')
     if ($LASTEXITCODE -ne 0) { throw 'Could not compile syntax checker.' }
-    $changedKotlin = @(& git -C $repo diff --name-only -- '*.kt') + @(& git -C $repo ls-files --others --exclude-standard -- '*.kt') |
+    [string[]]$changedKotlin = @(& git -C $repo diff --name-only -- '*.kt') + @(& git -C $repo ls-files --others --exclude-standard -- '*.kt') |
         Sort-Object -Unique | ForEach-Object { Join-Path $repo $_ }
     & java -cp "$temp;$KotlinLib\*" CheckKotlinSyntax @changedKotlin
     if ($LASTEXITCODE -ne 0) { throw 'Kotlin syntax checks failed.' }
@@ -34,12 +34,12 @@ try {
     $concertModels = $concert.Substring($concert.IndexOf('@Serializable'), $concert.IndexOf('@Singleton') - $concert.IndexOf('@Serializable'))
     $timestamp = $concert.Substring($concert.IndexOf('fun parseConcertTimestampMs('))
     "package com.lastwave.app.data.video`nimport kotlinx.serialization.Serializable`nimport java.util.UUID`n$concertModels`n$timestamp" | Set-Content -LiteralPath "$temp\ConcertModels.kt"
-    foreach ($dependency in @(@('junit','junit','4.13.2'), @('org/hamcrest','hamcrest-core','1.3'), @('org/jetbrains/kotlinx','kotlinx-coroutines-test-jvm','1.10.2'), @('com/squareup/okhttp3','okhttp','4.12.0'), @('com/squareup/okio','okio-jvm','3.6.0'), @('javax/inject','javax.inject','1'))) {
+    foreach ($dependency in @(@('junit','junit','4.13.2'), @('org/hamcrest','hamcrest-core','1.3'), @('org/jetbrains/kotlinx','kotlinx-coroutines-test-jvm','1.10.2'), @('com/squareup/okhttp3','okhttp','4.12.0'), @('com/squareup/okhttp3','mockwebserver','4.12.0'), @('com/squareup/okio','okio-jvm','3.6.0'), @('javax/inject','javax.inject','1'))) {
         $group, $name, $version = $dependency
         Invoke-WebRequest -Uri "https://repo.maven.apache.org/maven2/$group/$name/$version/$name-$version.jar" -OutFile "$temp\$name.jar"
     }
     $runtimeJars = Get-ChildItem -LiteralPath $KotlinLib -File | Where-Object { $_.Name -match '^kotlin-stdlib.*\.jar$|^kotlinx-serialization-core.*\.jar$|^kotlinx-coroutines-core.*\.jar$|^annotations.*\.jar$' }
-    $classpath = (($runtimeJars.FullName + @("$temp\junit.jar", "$temp\hamcrest-core.jar", "$temp\kotlinx-coroutines-test-jvm.jar", "$temp\okhttp.jar", "$temp\okio-jvm.jar", "$temp\javax.inject.jar")) -join [IO.Path]::PathSeparator)
+    $classpath = (($runtimeJars.FullName + @("$temp\junit.jar", "$temp\hamcrest-core.jar", "$temp\kotlinx-coroutines-test-jvm.jar", "$temp\okhttp.jar", "$temp\mockwebserver.jar", "$temp\okio-jvm.jar", "$temp\javax.inject.jar")) -join [IO.Path]::PathSeparator)
     $sources = @("$temp\LyricsCore.kt", "$temp\PlaybackModels.kt", "$temp\ConcertModels.kt") + @(
         'app/src/main/java/com/lastwave/app/data/lyrics/CustomLyrics.kt',
         'app/src/main/java/com/lastwave/app/data/lyrics/LyricsTranslation.kt',
