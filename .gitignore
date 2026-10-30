@@ -61,6 +61,9 @@ tools/*
 !tools/test-recording-identity.sh
 !tools/test-feature-core.ps1
 !tools/CheckKotlinSyntax.java
+!tools/setup-managed-updates.ps1
+!tools/publish-managed-update.py
+!tools/test-managed-updates.py
 provider.js
 # Single raw provider source at repo base only (plaintext JSON, encrypted at build)
 provider.json
@@ -75,3 +78,6 @@ lastwave-addon-service/
 *.zip
 credentials_backup*
 
+
+# Generated managed-update publication bundles
+managed-dist/

@@ -264,11 +264,14 @@ object DatabaseModule {
     @Singleton
     fun provideAppDatabase(@ApplicationContext context: Context): AppDatabase =
         Room.databaseBuilder(context, AppDatabase::class.java, "lastwave.db")
-            // PlaylistRepository mirrors playlists to public JSON before
-            // future schema changes can rebuild Room, then restores that
-            // mirror if the database opens empty. Artwork is cache.
-            .fallbackToDestructiveMigration()
-            .fallbackToDestructiveMigrationOnDowngrade()
+            .apply {
+                // Managed channel changes must never silently erase app data.
+                // Missing migrations fail closed; legacy installs keep their behavior.
+                if (context.packageName != com.lastwave.app.data.update.UpdatePolicy.PACKAGE_ID) {
+                    fallbackToDestructiveMigration()
+                    fallbackToDestructiveMigrationOnDowngrade()
+                }
+            }
             .addMigrations(
                 migration4To5,
                 migration5To6,
