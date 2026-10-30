@@ -1,6 +1,6 @@
 # Download latency investigation
 
-This test build adds measurements, not a claimed speed fix. Audio/video quality,
+The initial diagnostic test build (1000040) added measurements, not a claimed speed fix. Audio/video quality,
 HTTP request sizes, file-export behavior, and concurrency defaults are unchanged.
 The user sees roughly 1 second per song in YouTube Music versus 10+ seconds in
 LastWave and specifically notices Finding YouTube stream and Saving video.
@@ -62,3 +62,56 @@ be throttled: https://github.com/yt-dlp/yt-dlp/wiki/FAQ . That is a lead to test
 not evidence that this phone's current bottleneck is throttling. No speculative
 chunking, n transformation, quality downgrade, or file-storage migration is
 introduced in this diagnostic build.
+
+## Phone capture: 2026-10-30, build 1000040
+
+The three completed Audio + video jobs identify a concrete transfer-path problem:
+
+| Anonymous job | Audio resolve | Video resolve | Main audio transfer | Video / soundtrack transfer span | Final processing | Transfer-slot wait |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 7.68 s | 1.74 s | 0.27 s | 134.10 s | 5.65 s | 0 s |
+| 2 | 7.76 s | 1.76 s | 0.30 s | 94.93 s | 4.44 s | 0 s |
+| 3 | 8.12 s | 1.82 s | 0.29 s | 127.51 s | 5.40 s | 88.45 s |
+
+Main audio used four bounded byte ranges and achieved 83–128 Mbit/s. Video
+(5.6–9.7 MB) and its own soundtrack (3.1–4.4 MB) each used one unbounded GET;
+their effective rates were 0.26–0.81 Mbit/s. First-byte waits were under 0.7 s,
+with no failed/retried requests in these three jobs. Video transfer, not initial
+connection setup or writing tags, dominated this capture. Job 3 waited for the
+admitted slow transfers ahead of it; increasing playlist concurrency alone is
+not the fix. Timers overlap and the table must not be summed as sequential stages.
+
+These measurements strongly implicate the different request strategy. They do
+not establish the CDN's internal throttling algorithm or YouTube Music's private
+implementation. Raw logs, recording identities, and signed URLs are not stored
+in this repository.
+
+### Targeted follow-up change
+
+Google video CDN offline video and soundtrack downloads now use 1 MiB ranges
+with at most four workers per media file. The first actual range discovers the
+total length and is retained (no HEAD/probe request or duplicate first chunk).
+A dedicated, bounded offline dispatcher prevents these subrequests from taking
+over playback/API admission. Existing playlist transfer/finishing limits remain.
+
+Every response must match its requested range, total and exact body length;
+entity validators are retained when supplied. If the first request returns a
+whole-file 200, it consumes that body once as a compatible single-request
+fallback. A later ignored/changed range fails safely instead of mixing bytes.
+Transient I/O/5xx errors get one bounded same-range retry, with monotonic logical
+progress; 4xx and protocol errors do not silently retry unbounded transfers.
+Cancellation joins all native readers before partial-file cleanup. Device and
+non-Google-video HTTP sources retain their existing single-stream strategy.
+
+Both media files remain the selected video's own exact streams. Main audio,
+video format/resolution, soundtrack selection, storage destinations, tagging,
+and the app's playlist concurrency setting are unchanged. There is no transcoding,
+substitution, or studio-audio reuse. The same diagnostics remain enabled for the
+next phone comparison; **post-change phone speed is not yet measured**.
+
+The 7.7–8.1 s audio resolution and 4.4–5.7 s final processing remain secondary
+targets. They are not claimed fixed by this transfer change, and duplicate
+audio/video extraction or optional enrichment can be investigated separately
+after checking the dominant bottleneck. Persisted crashes from older build
+1000036 in the report are not evidence of a new crash in the captured 1000040
+download jobs, which all completed successfully.

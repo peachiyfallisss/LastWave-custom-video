@@ -20,6 +20,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.*
@@ -35,20 +36,29 @@ class OfflineVideoTest {
     private val context: Context = RuntimeEnvironment.getApplication()
     private val youtube = mockk<YouTubeStreamExtractor>()
     private val live = PlayableTrack("Song LIVE", "Artist", videoId = "live1234567")
-    private fun repository(failAudio: Boolean = false, onRequest: (Boolean) -> Unit = {}): TrackVideoRepository {
+    private fun repository(failAudio: Boolean = false, onRequest: (Boolean) -> Unit = {},
+        rangedYoutube: Boolean = false, inspect: (Request) -> Unit = {}): TrackVideoRepository {
         context.getSharedPreferences("lastwave_track_videos", Context.MODE_PRIVATE).edit().clear().commit()
         File(context.filesDir, "offline-videos").deleteRecursively()
         val http = OkHttpClient.Builder().addInterceptor { chain ->
             val request = chain.request()
             val audio = request.url.encodedPath == "/audio"
             onRequest(audio)
+            inspect(request)
+            val bytes = (if (audio) "original live soundtrack" else "original live video")
+                .repeat(if (rangedYoutube) 80_000 else 1).toByteArray()
+            val range = request.header("Range")?.let { Regex("bytes=(\\d+)-(\\d+)").matchEntire(it) }
+            val start = range?.groupValues?.get(1)?.toInt() ?: 0
+            val end = minOf(range?.groupValues?.get(2)?.toInt() ?: bytes.lastIndex, bytes.lastIndex)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1)
-                .code(if (audio && failAudio) 500 else 200).message("test")
-                .body((if (audio) "original live soundtrack" else "original live video").toResponseBody()).build()
+                .code(if (audio && failAudio) 500 else if (range != null) 206 else 200).message("test")
+                .apply { if (range != null) header("Content-Range", "bytes $start-$end/${bytes.size}") }
+                .body(bytes.copyOfRange(start, end + 1).toResponseBody()).build()
         }.build()
+        val host = if (rangedYoutube) "r1---sn-test.googlevideo.com" else "example.test"
         coEvery { youtube.resolveVideoStream("live1234567", any()) } answers {
-            MusicPlayer.ResolvedStream("https://example.test/video", "video/mp4", null, null, "live-video",
-                companionAudio = MusicPlayer.ResolvedStream("https://example.test/audio", "audio/mp4", null, null, "live-audio"))
+            MusicPlayer.ResolvedStream("https://$host/video", "video/mp4", null, null, "live-video",
+                companionAudio = MusicPlayer.ResolvedStream("https://$host/audio", "audio/mp4", null, null, "live-audio"))
         }
         return TrackVideoRepository(context, youtube, http)
     }
@@ -75,6 +85,35 @@ class OfflineVideoTest {
         assertFalse(repo.hasOfflineVideo(live))
         assertEquals("https://www.youtube.com/watch?v=live1234567", repo.sourceFor(live))
         assertTrue(File(context.filesDir, "offline-videos").listFiles().orEmpty().isEmpty())
+    }
+
+    @Test fun youtubeOfflineVideoAndItsExactLiveSoundtrackBothUseBoundedRanges() = runBlocking {
+        val requests = java.util.Collections.synchronizedList(mutableListOf<Request>())
+        val repo = repository(rangedYoutube = true, inspect = { requests += it })
+        val progress = mutableListOf<Int>()
+        repo.downloadVideo(live, listOf("/music/live.opus")) { progress += it }
+        val offline = repo.resolve(repo.sourceFor(live)!!)
+        assertEquals("original live video".repeat(80_000), File(Uri.parse(offline.url).path!!).readText())
+        assertEquals("original live soundtrack".repeat(80_000), File(Uri.parse(offline.companionAudio!!.url).path!!).readText())
+        assertEquals(4, requests.size)
+        assertEquals(setOf("/video", "/audio"), requests.map { it.url.encodedPath }.toSet())
+        requests.forEach { request ->
+            val range = Regex("bytes=(\\d+)-(\\d+)").matchEntire(request.header("Range").orEmpty())!!
+            assertTrue(range.groupValues[2].toLong() - range.groupValues[1].toLong() + 1 <= 1024 * 1024)
+        }
+        assertEquals(100, progress.last())
+        assertEquals(progress.sorted().distinct(), progress)
+    }
+
+    @Test fun rangedSoundtrackFailureStillCannotPublishVideoOrDeleteSavedSong() = runBlocking {
+        val repo = repository(failAudio = true, rangedYoutube = true)
+        val audio = File(context.filesDir, "completed-live.opus").apply { writeText("saved song") }
+        try {
+            assertTrue(runCatching { repo.downloadVideo(live, listOf(audio.absolutePath)) { } }.isFailure)
+            assertFalse(repo.hasOfflineVideo(live))
+            assertEquals("saved song", audio.readText())
+            assertTrue(File(context.filesDir, "offline-videos").listFiles().orEmpty().isEmpty())
+        } finally { audio.delete() }
     }
 
     @Test fun changingSelectedVideoNeverReusesDifferentOfflineRendition() = runBlocking {

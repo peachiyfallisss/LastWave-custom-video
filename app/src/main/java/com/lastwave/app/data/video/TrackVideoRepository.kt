@@ -5,7 +5,7 @@ import android.net.Uri
 import com.lastwave.app.data.download.DownloadDiagnostics
 import com.lastwave.app.data.download.DownloadRequestTag
 import com.lastwave.app.data.download.DownloadTrace
-import com.lastwave.app.data.download.awaitDownloadResponse
+import com.lastwave.app.data.download.RangedMediaDownloader
 import com.lastwave.app.data.music.YouTubeStreamExtractor
 import com.lastwave.app.playback.MusicPlayer
 import com.lastwave.app.playback.PlayableTrack
@@ -25,6 +25,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
+import okhttp3.Dispatcher
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
@@ -51,8 +52,13 @@ class TrackVideoRepository @Inject constructor(
     private val downloadClient = http.newBuilder()
         .eventListenerFactory(downloadDiagnostics.listenerFactory)
         .addNetworkInterceptor(downloadDiagnostics.networkInterceptor)
+        // Offline range workers must not occupy the playback/API dispatcher.
+        // Playlist admission still belongs to DownloadPipeline; these are only
+        // bounded subrequests within its admitted video/soundtrack transfers.
+        .dispatcher(Dispatcher().apply { maxRequests = 24; maxRequestsPerHost = 8 })
         .callTimeout(30, TimeUnit.MINUTES)
         .readTimeout(30, TimeUnit.SECONDS).build()
+    private val mediaDownloader = RangedMediaDownloader(downloadClient)
 
     private fun identityKey(track: PlayableTrack): String = preferences.getString("alias:${key(track)}", null) ?: key(track)
     private fun selectedSource(track: PlayableTrack): String? = customSourceFor(track)
@@ -209,30 +215,7 @@ class TrackVideoRepository @Inject constructor(
             return
         }
         val request = Request.Builder().url(part.url).tag(DownloadRequestTag::class.java, tag).apply { part.requestHeaders.forEach { (key, value) -> header(key, value) } }.build()
-        val call = downloadClient.newCall(request)
-        awaitDownloadResponse(call) { response, isActive ->
-            if (!response.isSuccessful) throw IOException("Video download failed (HTTP ${response.code}).")
-            if (response.code == 206) {
-                val range = Regex("bytes 0-([0-9]+)/([0-9]+)").matchEntire(response.header("Content-Range").orEmpty())
-                if (range == null || range.groupValues[1].toLong() + 1 != range.groupValues[2].toLong())
-                    throw IOException("Video server returned only part of the file.")
-            }
-            val body = response.body ?: throw IOException("Empty video response.")
-            if (body.contentType()?.type == "text") throw IOException("Video server returned a page instead of media.")
-            val expected = body.contentLength()
-            var count = 0L
-            body.byteStream().use { input -> destination.outputStream().use { out ->
-                val buffer = ByteArray(128 * 1024)
-                while (isActive()) {
-                    val size = input.read(buffer)
-                    if (size < 0) break
-                    out.write(buffer, 0, size)
-                    count += size
-                    if (expected > 0) progress((count * 100 / expected).toInt().coerceIn(0, 100))
-                }
-            } }
-            if (isActive() && (count == 0L || (expected > 0 && count != expected))) throw IOException("Video download incomplete.")
-        }
+        mediaDownloader.copy(request, destination, onProgress = progress)
     }
 
     fun deleteOfflineVideo(audioPath: String) {
