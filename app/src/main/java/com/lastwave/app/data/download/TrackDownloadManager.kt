@@ -410,15 +410,17 @@ class TrackDownloadManager @Inject constructor(
     }
 
     fun cancelDownload(key: String) {
-        retryRequests.remove(key)
-        reconnectGenerations[key]?.incrementAndGet()
-        val job = activeJobs[key]
-        job?.cancel()
-        // Keep the key reserved until the worker has joined native readers and
-        // cleaned its own files. An immediate requeue must not race that cleanup.
-        if (job == null) abandonDownload(key)
-        notificationManager?.cancel(key.hashCode())
-        _downloads.update { it - key }
+        synchronized(admissionLock) {
+            retryRequests.remove(key)
+            reconnectGenerations[key]?.incrementAndGet()
+            val job = activeJobs[key]
+            job?.cancel()
+            // Keep the key reserved until the worker has joined native readers and
+            // cleaned its own files. An immediate requeue must not race that cleanup.
+            if (job == null) abandonDownload(key)
+            notificationManager?.cancel(key.hashCode())
+            _downloads.update { it - key }
+        }
     }
 
     fun cancelDownload(title: String, artist: String) {
@@ -642,6 +644,10 @@ class TrackDownloadManager @Inject constructor(
                         null
                     } catch (cancelled: CancellationException) { throw cancelled }
                     catch (failure: Exception) { videoFailureMessage(failure) }
+                    catch (oom: OutOfMemoryError) {
+                        android.util.Log.e("TrackDownloadManager", "Insufficient memory saving optional video", oom)
+                        "Audio saved; video failed: Not enough memory — retry one song at a time"
+                    }
                 }
             }
 

@@ -140,6 +140,18 @@ class DownloadPipelineIntegrationTest {
         verify(timeout = 5_000, exactly = 1) { firstVideo.close() }
     }
 
+    @Test fun optionalVideoMemoryFailureDoesNotCancelSuccessfulAudio() = runBlocking {
+        val staged = mockk<TrackVideoRepository.PreparedDownload>(relaxed = true)
+        pending["First"] = staged
+        coEvery { staged.transfer(any()) } throws OutOfMemoryError("simulated video memory pressure")
+        enqueue("First", "first123456")
+        val result = withTimeout(10_000) { manager.downloads.first { it.values.any { p -> p.isFinished } } }.values.single()
+        assertTrue(result.error.orEmpty().contains("Not enough memory"))
+        assertEquals(1, rows.size)
+        verify(exactly = 0) { staged.publish(any()) }
+        verify(timeout = 5_000, exactly = 1) { staged.close() }
+    }
+
     @Test fun videoFailureSavesAudioAndRetryOnlyTransfersMissingVideo() = runBlocking {
         val staged = mockk<TrackVideoRepository.PreparedDownload>(relaxed = true)
         pending["First"] = staged
