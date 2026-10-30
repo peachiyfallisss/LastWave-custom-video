@@ -107,6 +107,7 @@ class YouTubeStreamExtractor @Inject constructor(
                 url = video.content, mimeType = video.format?.mimeType ?: "video/mp4",
                 bitrateKbps = audio?.bitrateKbps, audioCodec = audio?.audioCodec,
                 cacheKey = cacheKey, requestHeaders = headers, durationMs = duration, companionAudio = audio,
+                videoHeight = video.height.takeIf { it > 0 } ?: Regex("[0-9]+").find(video.resolution)?.value?.toIntOrNull(),
                 expiresAtEpochMs = video.content.toHttpUrlOrNull()?.queryParameter("expire")?.toLongOrNull()?.times(1_000L),
             )
         }

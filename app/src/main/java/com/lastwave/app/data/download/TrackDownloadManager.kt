@@ -147,6 +147,7 @@ class TrackDownloadManager @Inject constructor(
     private val flacTranscoder: ModuleFlacTranscoder,
     private val losslessMusicApi: LosslessMusicApi,
     private val videoRepository: TrackVideoRepository,
+    private val downloadDiagnostics: DownloadDiagnostics = DownloadDiagnostics(),
 ) {
     private val downloadSourcePreferences = context.getSharedPreferences("lastwave_download_sources", Context.MODE_PRIVATE)
     private val retryRequests = ConcurrentHashMap<String, () -> Unit>()
@@ -185,6 +186,8 @@ class TrackDownloadManager @Inject constructor(
     // read buffer, and unbounded pooling kept idle connections (and their
     // buffers) alive for minutes across successive downloads.
     private val downloadClient = okHttpClient.newBuilder()
+        .eventListenerFactory(downloadDiagnostics.listenerFactory)
+        .addNetworkInterceptor(downloadDiagnostics.networkInterceptor)
         .dispatcher(Dispatcher().apply {
             maxRequests = 24
             maxRequestsPerHost = 8
@@ -468,6 +471,7 @@ class TrackDownloadManager @Inject constructor(
             retryRequests[key] = { downloadTrack(title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl) }
             updateProgress(DownloadProgress(key, title, artist, formatBadge = "Queued"))
             reconnectGenerations[key] = AtomicLong()
+            val diagnosticId = downloadDiagnostics.begin(key)
             val job = applicationScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
                 var enteredWorker = false
                 try {
@@ -475,7 +479,7 @@ class TrackDownloadManager @Inject constructor(
                     downloadPipeline.run { lease ->
                         enteredWorker = true
                         coroutineScope {
-                            runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl, lease)
+                            runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl, lease, diagnosticId)
                         }
                     }
                 } catch (cancelled: CancellationException) {
@@ -485,6 +489,11 @@ class TrackDownloadManager @Inject constructor(
             }
             activeJobs[key] = job
             job.invokeOnCompletion {
+                downloadDiagnostics.finish(key, diagnosticId, when {
+                    job.isCancelled -> "cancelled"
+                    _downloads.value[key]?.error != null -> "error"
+                    else -> "success"
+                })
                 // A scheduled LAZY job can be cancelled before its body ever
                 // runs. Its catch/finally cannot clean the admission key then.
                 synchronized(admissionLock) {
@@ -514,7 +523,9 @@ class TrackDownloadManager @Inject constructor(
         includeVideo: Boolean,
         playbackUrl: String?,
         lease: DownloadPipeline.Lease,
+        diagnosticId: Long,
     ) {
+            downloadDiagnostics.trace.worker(diagnosticId)
             if (downloadsWiping) {
                 abandonDownload(key)
                 return
@@ -638,7 +649,11 @@ class TrackDownloadManager @Inject constructor(
                 if (!includeVideo || videoTransfer != null) return
                 videoTransfer = async(Dispatchers.IO) {
                     try {
-                        val prepared = prepareVideoExtra(track, fallbackVideoId)
+                        downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.VIDEO_RESOLVE)
+                        val prepared = try { prepareVideoExtra(track, fallbackVideoId) }
+                            finally { downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.VIDEO_RESOLVE) }
+                        prepared.diagnosticId = diagnosticId
+                        downloadDiagnostics.trace.video(diagnosticId, prepared.videoHeight ?: 0)
                         pendingVideo = prepared
                         prepared.transfer(::reportVideoProgress)
                         null
@@ -760,6 +775,8 @@ class TrackDownloadManager @Inject constructor(
                     null
                 }
 
+                downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.PREPARE_METADATA)
+                downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
                 // 1. Resolve source — respect user's download quality preference (Lossless tiers or YouTube Music)
                 val misc = runCatching { settingsPreferences.settings.first() }.getOrDefault(MiscSettings())
                 val shouldDownloadLyrics = misc.downloadLyrics
@@ -1083,7 +1100,9 @@ class TrackDownloadManager @Inject constructor(
                         }
 
                         if (resolvedUrl != null) {
-                            lease.beginTransfer()
+                            downloadDiagnostics.trace.source(diagnosticId, "PROVIDER", 0)
+                            downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
+                            acquireTransferSlot(lease, diagnosticId)
                             startVideoTransfer(PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl), videoId)
                             val rawFile = File.createTempFile("dl_raw_", ".$extension", context.cacheDir)
                                 tempDownloadFile = rawFile
@@ -1279,6 +1298,7 @@ class TrackDownloadManager @Inject constructor(
 
                 // 2. Fallback to YouTube Music if module was not requested or module download failed
                 if (!downloadSucceeded) {
+                    downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
                     try {
                         updateStage("Finding YouTube stream…", notify = true)
                         val lookupArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: ""
@@ -1364,6 +1384,8 @@ class TrackDownloadManager @Inject constructor(
                             ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
                             ?.takeIf { it.isNotBlank() }
                         val ytStream = resolvedStream
+                        downloadDiagnostics.trace.source(diagnosticId, ytStream.clientProfile, ytStream.bitrate)
+                        downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
                         resolvedUrl = ytStream.url
                         downloadHeaders = ytStream.requestHeaders
                         expectedContentLength = ytStream.contentLength
@@ -1393,7 +1415,7 @@ class TrackDownloadManager @Inject constructor(
                         }
                         isLossless = false
 
-                        lease.beginTransfer()
+                        acquireTransferSlot(lease, diagnosticId)
                         startVideoTransfer(PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl), resolvedYtVideoId)
                         val rawFile = File.createTempFile("dl_raw_", ".$extension", context.cacheDir)
                         tempDownloadFile = rawFile
@@ -1545,9 +1567,11 @@ class TrackDownloadManager @Inject constructor(
                     audioTransferComplete.set(true)
                     if (videoTransfer?.isCompleted == false) reportVideoProgress(videoPercent.get())
                     var videoError = videoTransfer?.await()
+                    downloadDiagnostics.trace.logicalMedia(diagnosticId, bytesReadTotal,
+                        pendingVideo?.videoFileBytes ?: 0L, pendingVideo?.soundtrackFileBytes ?: 0L)
                     // All media bytes are now local. The next prepared song may start
                     // while these files are remuxed, tagged, enriched, and published.
-                    lease.beginFinishing()
+                    acquireFinishingSlot(lease, diagnosticId)
                     ensureDownloadStillAllowed()
                     updateStage("Finishing files…")
                     val downloadedFile = tempDownloadFile ?: throw IOException("Downloaded file is missing")
@@ -1957,6 +1981,21 @@ class TrackDownloadManager @Inject constructor(
             }
     }
 
+    private suspend fun acquireTransferSlot(lease: DownloadPipeline.Lease, diagnosticId: Long?) {
+        diagnosticId?.let { downloadDiagnostics.trace.startPhase(it, DownloadTrace.Phase.TRANSFER_SLOT_WAIT) }
+        try { lease.beginTransfer() }
+        finally { diagnosticId?.let { downloadDiagnostics.trace.endPhase(it, DownloadTrace.Phase.TRANSFER_SLOT_WAIT) } }
+    }
+
+    private suspend fun acquireFinishingSlot(lease: DownloadPipeline.Lease, diagnosticId: Long?) {
+        diagnosticId?.let { downloadDiagnostics.trace.startPhase(it, DownloadTrace.Phase.FINISH_SLOT_WAIT) }
+        try { lease.beginFinishing() }
+        finally { diagnosticId?.let { downloadDiagnostics.trace.endPhase(it, DownloadTrace.Phase.FINISH_SLOT_WAIT) } }
+        diagnosticId?.let { downloadDiagnostics.trace.startPhase(it, DownloadTrace.Phase.FINISHING) }
+    }
+
+    fun downloadTimingReport(): String = downloadDiagnostics.report()
+
     fun isVideoDownloaded(title: String, artist: String, album: String?, videoId: String?): Boolean =
         videoRepository.hasOfflineVideo(PlayableTrack(title, artist, album, videoId = videoId))
 
@@ -1977,15 +2016,21 @@ class TrackDownloadManager @Inject constructor(
         track: PlayableTrack, resolvedVideoId: String?, lease: DownloadPipeline.Lease): String? {
         var pending: TrackVideoRepository.PreparedDownload? = null
         return try {
-            pending = prepareVideoExtra(track, resolvedVideoId)
-            lease.beginTransfer()
+            val diagnosticId = downloadDiagnostics.tag(key, DownloadTrace.Role.VIDEO)?.job
+            diagnosticId?.let { downloadDiagnostics.trace.endPhase(it, DownloadTrace.Phase.PREPARE_METADATA) }
+            diagnosticId?.let { downloadDiagnostics.trace.startPhase(it, DownloadTrace.Phase.VIDEO_RESOLVE) }
+            pending = try { prepareVideoExtra(track, resolvedVideoId) }
+                finally { diagnosticId?.let { downloadDiagnostics.trace.endPhase(it, DownloadTrace.Phase.VIDEO_RESOLVE) } }
+            pending.diagnosticId = diagnosticId
+            diagnosticId?.let { downloadDiagnostics.trace.video(it, pending.videoHeight ?: 0) }
+            acquireTransferSlot(lease, diagnosticId)
             pending.transfer { percent ->
                 updateProgress(DownloadProgress(key, audio.title, audio.artist, percent,
                     formatBadge = "Saving video • audio ready"))
                 runCatching { showDownloadNotification(key.hashCode(), key, audio.title, audio.artist,
                     percent, false, "Saving video • audio ready") }
             }
-            lease.beginFinishing()
+            acquireFinishingSlot(lease, diagnosticId)
             ensureDownloadStillAllowed()
             pending.publish(listOfNotNull(audio.filePath, audio.mediaStoreUri))
             null
@@ -2072,6 +2117,7 @@ class TrackDownloadManager @Inject constructor(
                 var downloadedBytesInRange = 0L
                 retryInterruptedTransfer(downloadKey, rangeConnectionStateChanged) {
                     downloadRange(
+                        downloadKey = downloadKey,
                         url = url,
                         target = target,
                         requestHeaders = requestHeaders,
@@ -2098,6 +2144,7 @@ class TrackDownloadManager @Inject constructor(
     }
 
     private suspend fun downloadRange(
+        downloadKey: String,
         url: String,
         target: File,
         requestHeaders: Map<String, String>,
@@ -2105,7 +2152,7 @@ class TrackDownloadManager @Inject constructor(
         expectedTotal: Long,
         onBytesRead: (Int) -> Unit,
     ): String {
-        val request = buildDownloadRequest(url, requestHeaders, range)
+        val request = buildDownloadRequest(url, requestHeaders, range, downloadKey = downloadKey)
         val call = downloadClient.newCall(request)
         return awaitDownloadResponse(call) { currentResponse, isActive ->
             validateMediaResponse(currentResponse, expectedCode = 206)
@@ -2167,6 +2214,7 @@ class TrackDownloadManager @Inject constructor(
                 return@retryInterruptedTransfer DownloadTransfer(expectedLength, expectedLength, "")
             }
             downloadSingleStreamAttempt(
+                downloadKey = downloadKey,
                 url = url,
                 target = target,
                 requestHeaders = requestHeaders,
@@ -2177,6 +2225,7 @@ class TrackDownloadManager @Inject constructor(
     }
 
     private suspend fun downloadSingleStreamAttempt(
+        downloadKey: String,
         url: String,
         target: File,
         requestHeaders: Map<String, String>,
@@ -2185,7 +2234,7 @@ class TrackDownloadManager @Inject constructor(
     ): DownloadTransfer {
         val resumeOffset = target.length().coerceAtLeast(0L)
         val call = downloadClient.newCall(
-            buildDownloadRequest(url, requestHeaders, range = null, resumeOffset = resumeOffset),
+            buildDownloadRequest(url, requestHeaders, range = null, resumeOffset = resumeOffset, downloadKey = downloadKey),
         )
         return awaitDownloadResponse(call) { currentResponse, isActive ->
             validateMediaResponse(currentResponse)
@@ -2411,6 +2460,7 @@ class TrackDownloadManager @Inject constructor(
             // 1. Download initialization segment (0.mp4) containing ftyp and moov boxes
             val initReq = Request.Builder()
                 .url(initUrl)
+                .tag(DownloadRequestTag::class.java, downloadDiagnostics.tag(downloadKey, DownloadTrace.Role.AUDIO))
                 .apply {
                     headers.forEach { (k, v) -> addHeader(k, v) }
                     if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
@@ -2446,6 +2496,7 @@ class TrackDownloadManager @Inject constructor(
                 }
                 val segReq = Request.Builder()
                     .url(segUrl)
+                    .tag(DownloadRequestTag::class.java, downloadDiagnostics.tag(downloadKey, DownloadTrace.Role.AUDIO))
                     .apply {
                         headers.forEach { (k, v) -> addHeader(k, v) }
                         if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
@@ -2571,8 +2622,10 @@ class TrackDownloadManager @Inject constructor(
         requestHeaders: Map<String, String>,
         range: DownloadRange?,
         resumeOffset: Long = 0L,
+        downloadKey: String,
     ): Request {
         val builder = Request.Builder().url(url)
+            .tag(DownloadRequestTag::class.java, downloadDiagnostics.tag(downloadKey, DownloadTrace.Role.AUDIO))
         requestHeaders.forEach { (name, value) -> builder.header(name, value) }
         if (requestHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
             builder.header("User-Agent", DOWNLOAD_USER_AGENT)

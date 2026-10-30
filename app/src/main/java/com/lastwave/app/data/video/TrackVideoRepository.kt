@@ -2,6 +2,9 @@ package com.lastwave.app.data.video
 
 import android.content.Context
 import android.net.Uri
+import com.lastwave.app.data.download.DownloadDiagnostics
+import com.lastwave.app.data.download.DownloadRequestTag
+import com.lastwave.app.data.download.DownloadTrace
 import com.lastwave.app.data.download.awaitDownloadResponse
 import com.lastwave.app.data.music.YouTubeStreamExtractor
 import com.lastwave.app.playback.MusicPlayer
@@ -38,13 +41,17 @@ class TrackVideoRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val youtube: YouTubeStreamExtractor,
     http: OkHttpClient,
+    private val downloadDiagnostics: DownloadDiagnostics = DownloadDiagnostics(),
 ) {
     private val contentResolver = context.contentResolver
     private val preferences = context.getSharedPreferences("lastwave_track_videos", Context.MODE_PRIVATE)
     private val client = http.newBuilder().callTimeout(20, TimeUnit.SECONDS).build()
 
     private val offlineRoot = File(context.filesDir, "offline-videos")
-    private val downloadClient = http.newBuilder().callTimeout(30, TimeUnit.MINUTES)
+    private val downloadClient = http.newBuilder()
+        .eventListenerFactory(downloadDiagnostics.listenerFactory)
+        .addNetworkInterceptor(downloadDiagnostics.networkInterceptor)
+        .callTimeout(30, TimeUnit.MINUTES)
         .readTimeout(30, TimeUnit.SECONDS).build()
 
     private fun identityKey(track: PlayableTrack): String = preferences.getString("alias:${key(track)}", null) ?: key(track)
@@ -101,6 +108,12 @@ class TrackVideoRepository @Inject constructor(
         private val source: String,
         private val resolved: MusicPlayer.ResolvedStream?,
     ) : AutoCloseable {
+        internal var diagnosticId: Long? = null
+        internal val videoHeight: Int? get() = resolved?.videoHeight
+        internal var videoFileBytes: Long = 0L
+            private set
+        internal var soundtrackFileBytes: Long = 0L
+            private set
         private var folder: File? = null
         private var transferred = resolved == null
         private var published = false
@@ -125,11 +138,13 @@ class TrackVideoRepository @Inject constructor(
                     if (percent > reported) { reported = percent; onProgress(percent) }
                 }
                 val soundtrack = stream.companionAudio?.let { part -> async {
-                    copyMedia(part, File(destination, "audio")) { progress(audio = it) }
+                    copyMedia(part, File(destination, "audio"), diagnosticId?.let { DownloadRequestTag(it, DownloadTrace.Role.VIDEO_AUDIO) }) { progress(audio = it) }
                 } }
-                copyMedia(stream, File(destination, "video")) { progress(video = it) }
+                copyMedia(stream, File(destination, "video"), diagnosticId?.let { DownloadRequestTag(it, DownloadTrace.Role.VIDEO) }) { progress(video = it) }
                 soundtrack?.await()
             }
+            videoFileBytes = File(destination, "video").length()
+            soundtrackFileBytes = File(destination, "audio").takeIf { it.isFile }?.length() ?: 0L
             currentCoroutineContext().ensureActive()
             transferred = true
         }
@@ -174,7 +189,7 @@ class TrackVideoRepository @Inject constructor(
         } finally { pending.close() }
     }
 
-    private suspend fun copyMedia(part: MusicPlayer.ResolvedStream, destination: File, progress: (Int) -> Unit) {
+    private suspend fun copyMedia(part: MusicPlayer.ResolvedStream, destination: File, tag: DownloadRequestTag?, progress: (Int) -> Unit) {
         val uri = Uri.parse(part.url)
         if (uri.scheme == "content" || uri.scheme == "file") {
             val input = if (uri.scheme == "content") contentResolver.openInputStream(uri) else File(uri.path!!).inputStream()
@@ -193,7 +208,7 @@ class TrackVideoRepository @Inject constructor(
             progress(100)
             return
         }
-        val request = Request.Builder().url(part.url).apply { part.requestHeaders.forEach { (key, value) -> header(key, value) } }.build()
+        val request = Request.Builder().url(part.url).tag(DownloadRequestTag::class.java, tag).apply { part.requestHeaders.forEach { (key, value) -> header(key, value) } }.build()
         val call = downloadClient.newCall(request)
         awaitDownloadResponse(call) { response, isActive ->
             if (!response.isSuccessful) throw IOException("Video download failed (HTTP ${response.code}).")

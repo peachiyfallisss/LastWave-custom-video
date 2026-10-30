@@ -53,6 +53,7 @@ class DownloadPipelineIntegrationTest {
     private val httpCount = AtomicInteger()
     private var onAudio: (String) -> Unit = {}
     private lateinit var manager: TrackDownloadManager
+    private val diagnostics = DownloadDiagnostics()
 
     @Before fun setup() {
         val app = RuntimeEnvironment.getApplication() as Context
@@ -89,7 +90,7 @@ class DownloadPipelineIntegrationTest {
         }.build()
         manager = TrackDownloadManager(context, innerTube, mockk(relaxed = true), mockk(relaxed = true),
             tagger, http, dao, settings, scope, mockk(relaxed = true), mockk(relaxed = true),
-            mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), videos)
+            mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), videos, diagnostics)
     }
 
     @After fun cleanup() {
@@ -138,6 +139,31 @@ class DownloadPipelineIntegrationTest {
         assertEquals(2, rows.size)
         verify(exactly = 1) { firstVideo.publish(any()) }
         verify(timeout = 5_000, exactly = 1) { firstVideo.close() }
+    }
+
+    @Test fun diagnosticsSeparateAudioAndVideoResolutionWithoutChangingQuality() = runBlocking {
+        coEvery { innerTube.resolveAudioStream(any()) } coAnswers {
+            kotlinx.coroutines.delay(150)
+            val id = firstArg<String>()
+            YouTubeAudioStream(id, "https://example.test/$id", 1, "audio/mpeg", "mp3", 128_000,
+                44_100, 1_000, 4_096, true, "test", "test")
+        }
+        coEvery { videos.prepareDownload(any(), any()) } coAnswers {
+            kotlinx.coroutines.delay(200)
+            mockk<TrackVideoRepository.PreparedDownload>(relaxed = true)
+        }
+        enqueue("First", "first123456")
+        withTimeout(10_000) { manager.downloads.first { it.values.any { p -> p.isFinished } } }
+        withTimeout(5_000) { while (!manager.downloadTimingReport().contains("result=success")) kotlinx.coroutines.delay(10) }
+        val report = manager.downloadTimingReport()
+        val audio = Regex("AUDIO_RESOLVE=([0-9]+)").find(report)!!.groupValues[1].toLong()
+        val video = Regex("VIDEO_RESOLVE=([0-9]+)").find(report)!!.groupValues[1].toLong()
+        assertTrue(audio >= 100)
+        assertTrue(video >= 150)
+        assertTrue(report.contains("profile=test audioBitrateBps=128000"))
+        assertTrue(report.contains("logicalAudioBytes=4096"))
+        assertFalse(report.contains("example.test"))
+        assertFalse(report.contains("Artist"))
     }
 
     @Test fun optionalVideoMemoryFailureDoesNotCancelSuccessfulAudio() = runBlocking {

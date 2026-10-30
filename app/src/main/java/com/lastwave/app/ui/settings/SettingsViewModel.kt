@@ -835,6 +835,8 @@ class SettingsViewModel @Inject constructor(
         sb.appendLine(readCrashReports())
         sb.appendLine("---- startup trail (how far the last launches got) ----")
         sb.appendLine(runCatching { com.lastwave.app.StartupTrail.readTail(context) }.getOrDefault("(startup trail unavailable)"))
+        sb.appendLine("---- download timings (no track titles or URLs in this section) ----")
+        sb.appendLine(downloadManager.downloadTimingReport())
         sb.appendLine("---- logcat (this process) ----")
         sb.append(readOwnLogcat())
         sb.appendLine("---- end ----")

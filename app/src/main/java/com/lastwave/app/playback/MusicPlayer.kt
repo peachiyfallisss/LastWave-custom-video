@@ -5117,6 +5117,8 @@ class MusicPlayer @Inject constructor(
         val expiresAtEpochMs: Long? = null,
         /** Soundtrack belonging to a video-only adaptive stream, never the catalog audio. */
         val companionAudio: ResolvedStream? = null,
+        /** Actual selected video rendition; diagnostic metadata only. */
+        val videoHeight: Int? = null,
     )
 
     private fun isNetworkException(error: Throwable): Boolean {
