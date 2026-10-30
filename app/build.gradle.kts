@@ -11,6 +11,9 @@ plugins {
     alias(libs.plugins.hilt)
 }
 
+// PR previews install alongside the user's existing custom app, regardless of debug signing key.
+val reworkPreview = providers.gradleProperty("reworkPreview").getOrElse("false").toBoolean()
+
 android {
     namespace = "com.lastwave.app"
     compileSdk = 37
@@ -63,6 +66,7 @@ android {
         targetSdk = 35
         versionCode = 28
         versionName = "4.2.2"
+        manifestPlaceholders["appLabel"] = "@string/app_name"
 
         // Native secrets (addon client lock) live strictly in native .so via
         // SecretsBridge_generated.h (tools/generate_native_secrets.py).
@@ -139,8 +143,9 @@ android {
         }
         debug {
             isDebuggable = true
-            applicationIdSuffix = ".custom"
-            versionNameSuffix = "-custom-video.9"
+            applicationIdSuffix = if (reworkPreview) ".custom.rework" else ".custom"
+            versionNameSuffix = "-custom-video.9" + if (reworkPreview) "-preview" else ""
+            if (reworkPreview) manifestPlaceholders["appLabel"] = "LastWave Rework Preview"
         }
     }
 

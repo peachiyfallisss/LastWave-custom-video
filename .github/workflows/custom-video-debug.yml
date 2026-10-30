@@ -32,13 +32,16 @@ jobs:
           bash tools/test-recording-identity.sh
           bash tools/test-playback-mode-cache.sh
       - name: Test and build APK
-        run: bash gradlew testDebugUnitTest assembleDebug --console=plain --stacktrace
+        run: bash gradlew testDebugUnitTest assembleDebug -PreworkPreview=${{ github.event_name == 'pull_request' }} --console=plain --stacktrace
       - name: Verify APK signature and package
         run: |
           apk=app/build/outputs/apk/debug/app-debug.apk
           apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)
           "$apksigner" verify --verbose "$apk"
           "$(dirname "$apksigner")/aapt" dump badging "$apk" | grep -E '^(package:|sdkVersion:|targetSdkVersion:|native-code:)'
+          expected_package=com.lastwave.app.custom
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then expected_package=com.lastwave.app.custom.rework; fi
+          "$(dirname "$apksigner")/aapt" dump badging "$apk" | grep -F "package: name='$expected_package'"
           sha256sum "$apk" > "$apk.sha256"
       - name: Upload test reports
         if: always()

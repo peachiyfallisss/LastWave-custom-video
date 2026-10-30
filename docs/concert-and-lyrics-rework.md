@@ -1,7 +1,20 @@
 # Concert, download, and lyrics rework
 
-Local development branch: `feat/custom-lyrics-translations`. This is a source
-change, not a published or device-verified APK.
+Development branch: `feat/custom-lyrics-translations`, draft PR #2. Android
+compilation, 303 unit tests, APK assembly, and signature verification passed in
+[the initial CI build](https://github.com/peachiyfallisss/LastWave-custom-video/actions/runs/40975825024).
+On-device visual/behavior verification is still pending.
+
+## Install-alongside preview
+
+Pull-request builds use `-PreworkPreview=true`: package
+`com.lastwave.app.custom.rework`, launcher label **LastWave Rework Preview**.
+They do not replace the existing custom app, which may have a different debug
+signing key. The preview has separate app-private data and requires its own
+sign-in/settings; it does not migrate the old app's data. Keep the original
+app installed. Select a separate download folder before testing download or
+deletion actions, because public Music folders can be shared between apps.
+Normal main-branch/manual builds retain `com.lastwave.app.custom`.
 
 ## UI
 
@@ -98,6 +111,8 @@ replacement for the complete Android test/build command:
 
 ```powershell
 .\gradlew.bat testDebugUnitTest assembleDebug --console=plain
+# Install-alongside preview:
+.\gradlew.bat testDebugUnitTest assembleDebug -PreworkPreview=true --console=plain
 ```
 
 The current local machine has no configured Android SDK. The baseline Gradle
