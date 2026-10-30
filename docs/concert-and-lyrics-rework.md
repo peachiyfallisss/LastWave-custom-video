@@ -75,15 +75,47 @@ projected song metadata.
 
 ## Downloads
 
-The existing FIFO concurrency limiter, validated HTTP ranges, exact-recording
-policy, and partial audio/video preservation are retained. The rework removes
-a redundant blocking song-details lookup for a selected recording whose title
-and artist are already valid. Lyrics lookup now starts **before** transfer, not
-after it. Lyrics/artwork enrichment has a bounded final wait; it cannot hold a
-completed file and the next queued job behind another provider waterfall.
-This does not claim measured parity with YouTube Music or change provider
-bandwidth limits. The retry action preserves the original request, including
-the exact selected video and Audio + video choice.
+The download backend now has three bounded stages, without a UI redesign:
+
+- **Preparation:** up to two preparers resolve upcoming recordings while media
+  transfers run. Admission bounds pre-finish jobs to the selected transfer limit
+  plus two lookahead jobs. Playlist preflight disk checks run in batches of four
+  rather than one filesystem/DAO check per enqueue.
+- **Transfers:** the existing 1–4-song setting is still honored (default two).
+  Main song audio and optional video overlap. Adaptive video and its own
+  soundtrack also transfer concurrently; studio audio is never substituted for a
+  custom video's soundtrack. Validated byte ranges and exact-recording checks
+  remain in place.
+- **Finishing:** after media transfers settle, their network permit is released
+  before remuxing, tagging, bounded lyrics/artwork waits, copying, and database
+  publication. Two finishers and bounded upstream admission provide disk/memory
+  backpressure rather than accumulating a playlist's temporary files.
+
+Video pairs are staged privately and published with aliases only after audio is
+saved. Failed video leaves the audio usable; retry preserves the exact original
+request and reuses completed matching audio. Cancellation joins native HTTP
+readers before removing staged files or returning a network permit. Cancelled
+keys stay reserved during cleanup so immediate requeues cannot race old writes.
+
+`LastWaveDownloadPipeline` debug logs report counter-only job IDs, stage timings,
+active song transfers, network-idle gaps, and whole-batch elapsed time. They do
+not include signed URLs, authentication headers, or song names. A batch is a
+continuous period with pending jobs, not a persistent playlist identifier.
+
+A deterministic eight-song virtual-clock regression, at the **same two-song
+limit**, takes 8,000 ms under the old sequential stages and 4,400 ms with this
+pipeline, with zero inter-transfer idle gaps. These are simulated workloads,
+**not phone benchmarks or measured parity with YouTube Music**. Provider
+bandwidth, extraction latency, device storage, and very slow finishing still
+matter. No quality reduction or source substitution was introduced.
+
+To benchmark on device, use the same playlist, quality, network, storage target,
+and concurrency setting. Remove only the test downloads before each run; do not
+clear unrelated user files. Capture `adb logcat -s LastWaveDownloadPipeline`,
+compare final `batchElapsedMs`, per-job `stageTimesMs`, and `idleGapMs`, and repeat
+cold and warm runs. Also test Audio only, Audio + video, custom live sources,
+failed video retry, cancellation during transfer/tagging, and clear-all while
+preparation/finishing are active. UI changes remain deferred.
 
 ## Lyrics storage and translation
 

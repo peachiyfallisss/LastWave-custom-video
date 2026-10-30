@@ -34,18 +34,22 @@ try {
     $concertModels = $concert.Substring($concert.IndexOf('@Serializable'), $concert.IndexOf('@Singleton') - $concert.IndexOf('@Serializable'))
     $timestamp = $concert.Substring($concert.IndexOf('fun parseConcertTimestampMs('))
     "package com.lastwave.app.data.video`nimport kotlinx.serialization.Serializable`nimport java.util.UUID`n$concertModels`n$timestamp" | Set-Content -LiteralPath "$temp\ConcertModels.kt"
-    foreach ($dependency in @(@('junit','junit','4.13.2'), @('org/hamcrest','hamcrest-core','1.3'))) {
+    foreach ($dependency in @(@('junit','junit','4.13.2'), @('org/hamcrest','hamcrest-core','1.3'), @('org/jetbrains/kotlinx','kotlinx-coroutines-test-jvm','1.10.2'))) {
         $group, $name, $version = $dependency
         Invoke-WebRequest -Uri "https://repo.maven.apache.org/maven2/$group/$name/$version/$name-$version.jar" -OutFile "$temp\$name.jar"
     }
     $runtimeJars = Get-ChildItem -LiteralPath $KotlinLib -File | Where-Object { $_.Name -match '^kotlin-stdlib.*\.jar$|^kotlinx-serialization-core.*\.jar$|^kotlinx-coroutines-core.*\.jar$|^annotations.*\.jar$' }
-    $classpath = (($runtimeJars.FullName + @("$temp\junit.jar", "$temp\hamcrest-core.jar")) -join [IO.Path]::PathSeparator)
+    $classpath = (($runtimeJars.FullName + @("$temp\junit.jar", "$temp\hamcrest-core.jar", "$temp\kotlinx-coroutines-test-jvm.jar")) -join [IO.Path]::PathSeparator)
     $sources = @("$temp\LyricsCore.kt", "$temp\PlaybackModels.kt", "$temp\ConcertModels.kt") + @(
         'app/src/main/java/com/lastwave/app/data/lyrics/CustomLyrics.kt',
         'app/src/main/java/com/lastwave/app/data/lyrics/LyricsTranslation.kt',
         'app/src/main/java/com/lastwave/app/playback/ConcertListeningState.kt',
         'app/src/main/java/com/lastwave/app/playback/InitialPlaybackSource.kt',
         'app/src/main/java/com/lastwave/app/data/download/DownloadEnrichment.kt',
+        'app/src/main/java/com/lastwave/app/data/download/DownloadConcurrencyLimiter.kt',
+        'app/src/main/java/com/lastwave/app/data/download/DownloadPipeline.kt',
+        'app/src/test/java/com/lastwave/app/data/download/DownloadConcurrencyLimiterTest.kt',
+        'app/src/test/java/com/lastwave/app/data/download/DownloadPipelineTest.kt',
         'app/src/test/java/com/lastwave/app/data/lyrics/CustomLyricsTest.kt',
         'app/src/test/java/com/lastwave/app/playback/ConcertListeningStateTest.kt',
         'app/src/test/java/com/lastwave/app/playback/InitialPlaybackSourceTest.kt',
@@ -53,7 +57,7 @@ try {
     ) | ForEach-Object { if ([IO.Path]::IsPathRooted($_)) { $_ } else { Join-Path $repo $_ } }
     & java -cp "$KotlinLib\*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -no-reflect -classpath $classpath -d "$temp\classes" @sources
     if ($LASTEXITCODE -ne 0) { throw 'Portable feature-core compilation failed.' }
-    & java -cp "$temp\classes;$classpath" org.junit.runner.JUnitCore com.lastwave.app.data.lyrics.CustomLyricsTest com.lastwave.app.playback.ConcertListeningStateTest com.lastwave.app.playback.InitialPlaybackSourceTest com.lastwave.app.data.download.DownloadEnrichmentTest
+    & java -cp "$temp\classes;$classpath" org.junit.runner.JUnitCore com.lastwave.app.data.lyrics.CustomLyricsTest com.lastwave.app.playback.ConcertListeningStateTest com.lastwave.app.playback.InitialPlaybackSourceTest com.lastwave.app.data.download.DownloadEnrichmentTest com.lastwave.app.data.download.DownloadConcurrencyLimiterTest com.lastwave.app.data.download.DownloadPipelineTest
     if ($LASTEXITCODE -ne 0) { throw 'Feature-core tests failed.' }
 } finally {
     $resolved = [IO.Path]::GetFullPath($temp)

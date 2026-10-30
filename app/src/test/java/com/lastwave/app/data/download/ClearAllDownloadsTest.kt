@@ -199,7 +199,7 @@ class ClearAllDownloadsTest {
     }
 
     @Test
-    fun changingConcurrencyStartsSecondJobAndWipeJoinsBothAndQueuedWork() = runBlocking {
+    fun preparationLookaheadAndQueuedWorkAreBothJoinedByWipe() = runBlocking {
         val entered = AtomicInteger()
         val first = CompletableDeferred<Unit>()
         val second = CompletableDeferred<Unit>()
@@ -213,11 +213,12 @@ class ClearAllDownloadsTest {
         manager.downloadTrack("First", "Artist")
         manager.downloadTrack("Second", "Artist", includeVideo = true)
         manager.downloadTrack("Third", "Artist")
-        withTimeout(5_000) { first.await() }
-        assertThat(entered.get()).isEqualTo(1)
-        settingsState.value = settingsState.value.copy(concurrentDownloads = 2)
-        withTimeout(5_000) { second.await() }
+        // Two preparers may run even with one network transfer. Both are
+        // held at the DAO here; changing the transfer setting must not admit
+        // unbounded preparation or let wipe miss either child.
+        withTimeout(5_000) { first.await(); second.await() }
         assertThat(entered.get()).isEqualTo(2)
+        settingsState.value = settingsState.value.copy(concurrentDownloads = 2)
         val jobs = manager.activeJobs().values.toList()
         withTimeout(5_000) { manager.clearAllDownloads() }
         assertThat(jobs.all { it.isCompleted }).isTrue()

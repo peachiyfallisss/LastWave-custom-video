@@ -64,7 +64,7 @@ android {
         applicationId = "com.lastwave.app"
         minSdk = (project.findProperty("minSdk") as? String)?.toIntOrNull() ?: 29
         targetSdk = 35
-        versionCode = 28
+        versionCode = 29
         versionName = "4.2.2"
         manifestPlaceholders["appLabel"] = "@string/app_name"
 
@@ -144,7 +144,7 @@ android {
         debug {
             isDebuggable = true
             applicationIdSuffix = if (reworkPreview) ".custom.rework" else ".custom"
-            versionNameSuffix = "-custom-video.9" + if (reworkPreview) "-preview" else ""
+            versionNameSuffix = "-custom-video.10" + if (reworkPreview) "-preview" else ""
             if (reworkPreview) manifestPlaceholders["appLabel"] = "LastWave Rework Preview"
         }
     }

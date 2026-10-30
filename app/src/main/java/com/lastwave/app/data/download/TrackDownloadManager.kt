@@ -48,6 +48,8 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -60,15 +62,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import com.lastwave.app.data.video.TrackVideoRepository
 import com.lastwave.app.playback.PlayableTrack
 import kotlinx.coroutines.withContext
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
@@ -87,12 +86,11 @@ import java.net.SocketException
 import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 data class DownloadProgress(
     val key: String,
@@ -215,7 +213,9 @@ class TrackDownloadManager @Inject constructor(
     private val activeUris = ConcurrentHashMap<String, Uri>()
     private val activeFiles = ConcurrentHashMap<String, File>()
     private val reconnectGenerations = ConcurrentHashMap<String, AtomicLong>()
-    private val downloadSlots = DownloadConcurrencyLimiter()
+    private val downloadPipeline = DownloadPipeline(report = { event ->
+        android.util.Log.d("LastWaveDownloadPipeline", event.toString())
+    })
     private val downloadLimitReady = CompletableDeferred<Unit>()
 
     private val _downloads = MutableStateFlow<Map<String, DownloadProgress>>(emptyMap())
@@ -226,14 +226,14 @@ class TrackDownloadManager @Inject constructor(
         applicationScope.launch(Dispatchers.IO) {
             try {
                 settingsPreferences.settings.map { it.concurrentDownloads }.distinctUntilChanged().collect { count ->
-                    downloadSlots.setLimit(count)
+                    downloadPipeline.setLimit(count)
                     downloadLimitReady.complete(Unit)
                 }
             } catch (cancelled: CancellationException) {
                 downloadLimitReady.cancel(cancelled)
                 throw cancelled
             } catch (failure: Exception) {
-                downloadSlots.setLimit(DownloadConcurrencyLimiter.DEFAULT_LIMIT)
+                downloadPipeline.setLimit(DownloadConcurrencyLimiter.DEFAULT_LIMIT)
                 downloadLimitReady.complete(Unit)
                 android.util.Log.w("TrackDownloadManager", "Download limit preference unavailable; using default", failure)
             }
@@ -411,19 +411,12 @@ class TrackDownloadManager @Inject constructor(
 
     fun cancelDownload(key: String) {
         retryRequests.remove(key)
-        activeKeys.remove(key)
-        reconnectGenerations.remove(key)?.incrementAndGet()
-        val job = activeJobs.remove(key)
+        reconnectGenerations[key]?.incrementAndGet()
+        val job = activeJobs[key]
         job?.cancel()
-
-        // Clean up partial media entry/file
-        activeUris.remove(key)?.let { uri ->
-            runCatching { context.contentResolver.delete(uri, null, null) }
-        }
-        activeFiles.remove(key)?.let { file ->
-            runCatching { if (file.exists()) file.delete() }
-        }
-
+        // Keep the key reserved until the worker has joined native readers and
+        // cleaned its own files. An immediate requeue must not race that cleanup.
+        if (job == null) abandonDownload(key)
         notificationManager?.cancel(key.hashCode())
         _downloads.update { it - key }
     }
@@ -474,7 +467,19 @@ class TrackDownloadManager @Inject constructor(
             updateProgress(DownloadProgress(key, title, artist, formatBadge = "Queued"))
             reconnectGenerations[key] = AtomicLong()
             val job = applicationScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl)
+                var enteredWorker = false
+                try {
+                    downloadLimitReady.await()
+                    downloadPipeline.run { lease ->
+                        enteredWorker = true
+                        coroutineScope {
+                            runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl, lease)
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    if (!enteredWorker) forgetDownloadKey(key)
+                    throw cancelled
+                }
             }
             activeJobs[key] = job
             job.start()
@@ -492,20 +497,10 @@ class TrackDownloadManager @Inject constructor(
         durationMs: Long?,
         includeVideo: Boolean,
         playbackUrl: String?,
+        lease: DownloadPipeline.Lease,
     ) {
-            // One permit covers this song's complete audio + optional video job.
-            // Queued jobs obey the current setting; running jobs finish when the limit shrinks.
-            // acquire() is cancellable; a cancel while queued must still
-            // release the key so the slot never strands.
-            try {
-                downloadLimitReady.await()
-                downloadSlots.acquire()
-            } catch (cancelled: CancellationException) {
-                forgetDownloadKey(key)
-                return
-            }
             if (downloadsWiping) {
-                abandonAcquiredDownload(key)
+                abandonDownload(key)
                 return
             }
             // Already downloaded? Skip re-downloading entirely rather than
@@ -514,13 +509,13 @@ class TrackDownloadManager @Inject constructor(
                 downloadedTrackDao.findByTrackKey(key)
                     ?: downloadedTrackDao.findByTitleAndArtist(title.trim(), artist.trim())
             } catch (cancelled: CancellationException) {
-                abandonAcquiredDownload(key)
+                abandonDownload(key)
                 return
             } catch (_: Exception) {
                 null
             }
             if (downloadsWiping) {
-                abandonAcquiredDownload(key)
+                abandonDownload(key)
                 return
             }
             if (existing != null) {
@@ -538,7 +533,7 @@ class TrackDownloadManager @Inject constructor(
                 if (fileStillPresent && DownloadRecordingPolicy.mayReuseFile(videoId, storedVideoId)) {
                     try {
                         if (includeVideo) {
-                            val videoError = downloadVideoExtra(key, existing, PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl, durationMs = durationMs), storedVideoId)
+                            val videoError = downloadVideoExtra(key, existing, PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl, durationMs = durationMs), storedVideoId, lease)
                             updateProgress(DownloadProgress(key, title, artist, 100,
                                 formatBadge = if (videoError == null) "AUDIO + VIDEO" else existing.formatBadge,
                                 isFinished = true, error = videoError))
@@ -550,7 +545,6 @@ class TrackDownloadManager @Inject constructor(
                     } catch (_: CancellationException) {
                         _downloads.update { it - key }
                     } finally {
-                        downloadSlots.release()
                         forgetDownloadKey(key, keepResult = true)
                     }
                     return
@@ -562,7 +556,7 @@ class TrackDownloadManager @Inject constructor(
                 val dirName = try {
                     currentDownloadDirName()
                 } catch (cancelled: CancellationException) {
-                    abandonAcquiredDownload(key)
+                    abandonDownload(key)
                     return
                 }
                 val sanitizedBase = sanitizeFilename("${artist.trim()} - ${title.trim()}")
@@ -579,7 +573,6 @@ class TrackDownloadManager @Inject constructor(
                 }.getOrDefault(false)
                 if (found) {
                     updateProgress(DownloadProgress(key, title, artist, 100, isFinished = true))
-                    downloadSlots.release()
                     forgetDownloadKey(key, keepResult = true)
                     return
                 }
@@ -612,6 +605,31 @@ class TrackDownloadManager @Inject constructor(
             var destinationFile: File? = null
             var audioPublished = false
             var tempDownloadFile: File? = null
+            var pendingVideo: TrackVideoRepository.PreparedDownload? = null
+            var videoTransfer: Deferred<String?>? = null
+            var artworkFallback: Deferred<String?>? = null
+            var lyricsDeferred: Deferred<LyricsResult?>? = null
+            var moduleLicenseDeferred: Deferred<OfflineKeys?>? = null
+            val audioTransferComplete = AtomicBoolean(false)
+            val videoPercent = AtomicInteger(0)
+            fun reportVideoProgress(percent: Int) {
+                videoPercent.set(percent)
+                if (!audioTransferComplete.get()) return
+                updateProgress(DownloadProgress(key, title, artist, percent, formatBadge = "Saving video…"))
+                runCatching { showDownloadNotification(notifId, key, title, artist, percent, false, "Saving video…") }
+            }
+            fun startVideoTransfer(track: PlayableTrack, fallbackVideoId: String?) {
+                if (!includeVideo || videoTransfer != null) return
+                videoTransfer = async(Dispatchers.IO) {
+                    try {
+                        val prepared = prepareVideoExtra(track, fallbackVideoId)
+                        pendingVideo = prepared
+                        prepared.transfer(::reportVideoProgress)
+                        null
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (failure: Exception) { videoFailureMessage(failure) }
+                }
+            }
 
             try {
                 ensureDownloadStillAllowed()
@@ -703,7 +721,7 @@ class TrackDownloadManager @Inject constructor(
                 // fans out into N artists/albums ("15 ml listens", "Track 3"...).
                 val finalKey = makeDownloadKey(finalTitle, finalArtist)
 
-                val artworkFallback = if (resolvedArtworkUrl == null) {
+                artworkFallback = if (resolvedArtworkUrl == null) {
                     async(Dispatchers.IO) {
                         kotlinx.coroutines.withTimeoutOrNull(4_000L) {
                         try {
@@ -726,7 +744,7 @@ class TrackDownloadManager @Inject constructor(
                 val misc = runCatching { settingsPreferences.settings.first() }.getOrDefault(MiscSettings())
                 val shouldDownloadLyrics = misc.downloadLyrics
                 // Start enrichment before stream resolution and transfer, not after the bytes arrive.
-                val lyricsDeferred = if (shouldDownloadLyrics) async(Dispatchers.IO) {
+                lyricsDeferred = if (shouldDownloadLyrics) async(Dispatchers.IO) {
                     kotlinx.coroutines.withTimeoutOrNull(8_000L) {
                         try { lyricsRepository.getLyrics(finalTitle, finalArtist, resolvedAlbum,
                             durationSeconds = durationMs?.let { (it / 1000L).toInt() }, videoId = videoId) }
@@ -775,7 +793,6 @@ class TrackDownloadManager @Inject constructor(
 
                 // 1. Provider module (.lwp engine): progressive clear FLAC/MP3 or segmented DASH (Dolby Atmos / Tidal Hi-Res)
                 var moduleDescriptor: SegmentedStreamDescriptor? = null
-                var moduleLicenseDeferred: Deferred<OfflineKeys?>? = null
                 var isDashModuleDownload = false
                 var dashInitUrl: String? = null
                 var dashMediaTemplate: String? = null
@@ -1039,13 +1056,15 @@ class TrackDownloadManager @Inject constructor(
                                 isLossless = !s.codec.equals("opus", ignoreCase = true)
                                 durationMs = desc.durationSec * 1000L
                                 // Offline license in parallel with the bytes.
-                                moduleLicenseDeferred = applicationScope.async(Dispatchers.IO) {
+                                moduleLicenseDeferred = async(Dispatchers.IO) {
                                     runCatching { offlineLicense.acquire(desc) }.getOrNull()
                                 }
                             }
                         }
 
                         if (resolvedUrl != null) {
+                            lease.beginTransfer()
+                            startVideoTransfer(PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl), videoId)
                             val rawFile = File.createTempFile("dl_raw_", ".$extension", context.cacheDir)
                                 tempDownloadFile = rawFile
 
@@ -1354,6 +1373,8 @@ class TrackDownloadManager @Inject constructor(
                         }
                         isLossless = false
 
+                        lease.beginTransfer()
+                        startVideoTransfer(PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl), resolvedYtVideoId)
                         val rawFile = File.createTempFile("dl_raw_", ".$extension", context.cacheDir)
                         tempDownloadFile = rawFile
 
@@ -1501,6 +1522,14 @@ class TrackDownloadManager @Inject constructor(
                     }
                 }
 
+                    audioTransferComplete.set(true)
+                    if (videoTransfer?.isCompleted == false) reportVideoProgress(videoPercent.get())
+                    var videoError = videoTransfer?.await()
+                    // All media bytes are now local. The next prepared song may start
+                    // while these files are remuxed, tagged, enriched, and published.
+                    lease.beginFinishing()
+                    ensureDownloadStillAllowed()
+                    updateStage("Finishing files…")
                     val downloadedFile = tempDownloadFile ?: throw IOException("Downloaded file is missing")
                     var currentAudioFile = downloadedFile
 
@@ -1811,7 +1840,13 @@ class TrackDownloadManager @Inject constructor(
                 // A video cancellation/failure must not delete a completed audio download.
                 activeUris.remove(key)
                 activeFiles.remove(key)
-                val videoError = if (includeVideo) downloadVideoExtra(key, entity, PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl, durationMs = durationMs), resolvedYtVideoId) else null
+                if (includeVideo && videoError == null) {
+                    try {
+                        ensureDownloadStillAllowed()
+                        checkNotNull(pendingVideo).publish(listOfNotNull(entity.filePath, entity.mediaStoreUri))
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (failure: Exception) { videoError = videoFailureMessage(failure) }
+                }
                 val finishedBadge = if (includeVideo && videoError == null) "$formatBadge + VIDEO" else formatBadge
                 updateProgress(
                     DownloadProgress(
@@ -1887,7 +1922,12 @@ class TrackDownloadManager @Inject constructor(
                     showErrorNotification(notifId, key, title, artist, error.localizedMessage ?: "Failed")
                 }
             } finally {
-                runCatching { downloadSlots.release() }
+                // Native HTTP callbacks must settle before staged files are removed.
+                withContext(NonCancellable) { videoTransfer?.cancelAndJoin() }
+                runCatching { pendingVideo?.close() }
+                artworkFallback?.cancel()
+                lyricsDeferred?.cancel()
+                moduleLicenseDeferred?.cancel()
                 activeKeys.remove(key)
                 activeJobs.remove(key)
                 activeUris.remove(key)
@@ -1900,28 +1940,38 @@ class TrackDownloadManager @Inject constructor(
     fun isVideoDownloaded(title: String, artist: String, album: String?, videoId: String?): Boolean =
         videoRepository.hasOfflineVideo(PlayableTrack(title, artist, album, videoId = videoId))
 
+    private fun videoFailureMessage(failure: Exception): String =
+        "Audio saved; video failed: ${failure.message ?: "try again while online"}"
+
+    private suspend fun prepareVideoExtra(track: PlayableTrack, resolvedVideoId: String?): TrackVideoRepository.PreparedDownload {
+        var fallback = resolvedVideoId
+        if (fallback == null && videoRepository.customSourceFor(track) == null && !videoRepository.hasOfflineVideo(track)) {
+            val match = innerTube.findBestMatchOrNull(track.title, track.artist, prefetchStreams = false)
+            if (match != null && DownloadRecordingPolicy.mayTryCandidate(track.videoId, match.videoId,
+                track.title, track.album, match.title, match.album, track.artist)) fallback = match.videoId
+        }
+        return videoRepository.prepareDownload(track, fallback)
+    }
+
     private suspend fun downloadVideoExtra(key: String, audio: DownloadedTrackEntity,
-        track: PlayableTrack, resolvedVideoId: String?): String? {
-        val requestedVideoId = track.videoId
+        track: PlayableTrack, resolvedVideoId: String?, lease: DownloadPipeline.Lease): String? {
+        var pending: TrackVideoRepository.PreparedDownload? = null
         return try {
-            var fallback = resolvedVideoId
-            if (fallback == null && videoRepository.customSourceFor(track) == null && !videoRepository.hasOfflineVideo(track)) {
-                val match = innerTube.findBestMatchOrNull(track.title, track.artist, prefetchStreams = false)
-                if (match != null && DownloadRecordingPolicy.mayTryCandidate(requestedVideoId, match.videoId,
-                    track.title, track.album, match.title, match.album, track.artist)) fallback = match.videoId
-            }
-            videoRepository.downloadVideo(track, listOfNotNull(audio.filePath, audio.mediaStoreUri), fallback) { percent ->
+            pending = prepareVideoExtra(track, resolvedVideoId)
+            lease.beginTransfer()
+            pending.transfer { percent ->
                 updateProgress(DownloadProgress(key, audio.title, audio.artist, percent,
                     formatBadge = "Saving video • audio ready"))
                 runCatching { showDownloadNotification(key.hashCode(), key, audio.title, audio.artist,
                     percent, false, "Saving video • audio ready") }
             }
+            lease.beginFinishing()
+            ensureDownloadStillAllowed()
+            pending.publish(listOfNotNull(audio.filePath, audio.mediaStoreUri))
             null
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Exception) {
-            "Audio saved; video failed: ${failure.message ?: "try again while online"}"
-        }
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: Exception) { videoFailureMessage(failure) }
+        finally { pending?.close() }
     }
 
     private suspend fun downloadToTempFile(
@@ -2034,64 +2084,50 @@ class TrackDownloadManager @Inject constructor(
         range: DownloadRange,
         expectedTotal: Long,
         onBytesRead: (Int) -> Unit,
-    ): String = suspendCancellableCoroutine { continuation ->
+    ): String {
         val request = buildDownloadRequest(url, requestHeaders, range)
         val call = downloadClient.newCall(request)
-        continuation.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(error)
+        return awaitDownloadResponse(call) { currentResponse, isActive ->
+            validateMediaResponse(currentResponse, expectedCode = 206)
+            val parsedRange = parseContentRange(currentResponse.header("Content-Range"))
+                ?: throw DownloadProtocolException("Missing Content-Range for parallel download")
+            if (parsedRange.start != range.start ||
+                parsedRange.endInclusive != range.endInclusive ||
+                parsedRange.total != expectedTotal
+            ) {
+                throw DownloadProtocolException("Mismatched Content-Range ${currentResponse.header("Content-Range")}")
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                try {
-                    val contentType = response.use { currentResponse ->
-                        validateMediaResponse(currentResponse, expectedCode = 206)
-                        val parsedRange = parseContentRange(currentResponse.header("Content-Range"))
-                            ?: throw DownloadProtocolException("Missing Content-Range for parallel download")
-                        if (parsedRange.start != range.start ||
-                            parsedRange.endInclusive != range.endInclusive ||
-                            parsedRange.total != expectedTotal
-                        ) {
-                            throw DownloadProtocolException("Mismatched Content-Range ${currentResponse.header("Content-Range")}")
-                        }
+            val body = currentResponse.body
+                ?: throw DownloadProtocolException("Empty range response body")
+            val bodyLength = body.contentLength()
+            if (bodyLength > 0L && bodyLength != range.length) {
+                throw DownloadProtocolException("Range length mismatch: received $bodyLength of ${range.length} bytes")
+            }
 
-                        val body = currentResponse.body
-                            ?: throw DownloadProtocolException("Empty range response body")
-                        val bodyLength = body.contentLength()
-                        if (bodyLength > 0L && bodyLength != range.length) {
-                            throw DownloadProtocolException("Range length mismatch: received $bodyLength of ${range.length} bytes")
+            RandomAccessFile(target, "rw").use { output ->
+                output.seek(range.start)
+                body.byteStream().use { input ->
+                    val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                    var remaining = range.length
+                    while (remaining > 0L) {
+                        if (!isActive()) throw CancellationException("Download cancelled")
+                        val read = try {
+                            input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                        } catch (error: IOException) {
+                            throw DownloadInterruptedException("Connection interrupted while reading audio", error)
                         }
-
-                        RandomAccessFile(target, "rw").use { output ->
-                            output.seek(range.start)
-                            body.byteStream().use { input ->
-                                val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
-                                var remaining = range.length
-                                while (remaining > 0L) {
-                                    if (!continuation.isActive) throw CancellationException("Download cancelled")
-                                    val read = try {
-                                        input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                                    } catch (error: IOException) {
-                                        throw DownloadInterruptedException("Connection interrupted while reading audio", error)
-                                    }
-                                    if (read < 0) {
-                                        throw DownloadInterruptedException("Range truncated with $remaining bytes remaining")
-                                    }
-                                    output.write(buffer, 0, read)
-                                    remaining -= read
-                                    onBytesRead(read)
-                                }
-                            }
+                        if (read < 0) {
+                            throw DownloadInterruptedException("Range truncated with $remaining bytes remaining")
                         }
-                        currentResponse.header("Content-Type").orEmpty()
+                        output.write(buffer, 0, read)
+                        remaining -= read
+                        onBytesRead(read)
                     }
-                    if (continuation.isActive) continuation.resume(contentType)
-                } catch (error: Exception) {
-                    if (continuation.isActive) continuation.resumeWithException(error)
                 }
             }
-        })
+            currentResponse.header("Content-Type").orEmpty()
+        }
     }
 
     private suspend fun downloadSingleStream(
@@ -2126,102 +2162,88 @@ class TrackDownloadManager @Inject constructor(
         requestHeaders: Map<String, String>,
         expectedContentLength: Long?,
         onProgress: (downloadedBytes: Long, totalBytes: Long) -> Unit,
-    ): DownloadTransfer = suspendCancellableCoroutine { continuation ->
+    ): DownloadTransfer {
         val resumeOffset = target.length().coerceAtLeast(0L)
         val call = downloadClient.newCall(
             buildDownloadRequest(url, requestHeaders, range = null, resumeOffset = resumeOffset),
         )
-        continuation.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(error)
+        return awaitDownloadResponse(call) { currentResponse, isActive ->
+            validateMediaResponse(currentResponse)
+            val body = currentResponse.body
+                ?: throw DownloadProtocolException("Empty response body")
+            val responseLength = body.contentLength().takeIf { it > 0L }
+            val partialRange = if (currentResponse.code == 206) {
+                parseContentRange(currentResponse.header("Content-Range"))
+                    ?: throw DownloadProtocolException("Missing Content-Range for partial response")
+            } else {
+                null
+            }
+            if (partialRange != null && (partialRange.start != resumeOffset ||
+                    partialRange.endInclusive + 1L != partialRange.total)
+            ) {
+                throw DownloadProtocolException("Server returned an unexpected audio range")
+            }
+            if (partialRange != null && expectedContentLength != null &&
+                partialRange.total != expectedContentLength
+            ) {
+                throw DownloadProtocolException(
+                    "Download size changed: expected $expectedContentLength, received ${partialRange.total}",
+                )
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                try {
-                    val transfer = response.use { currentResponse ->
-                        validateMediaResponse(currentResponse)
-                        val body = currentResponse.body
-                            ?: throw DownloadProtocolException("Empty response body")
-                        val responseLength = body.contentLength().takeIf { it > 0L }
-                        val partialRange = if (currentResponse.code == 206) {
-                            parseContentRange(currentResponse.header("Content-Range"))
-                                ?: throw DownloadProtocolException("Missing Content-Range for partial response")
-                        } else {
-                            null
-                        }
-                        if (partialRange != null && (partialRange.start != resumeOffset ||
-                                partialRange.endInclusive + 1L != partialRange.total)
-                        ) {
-                            throw DownloadProtocolException("Server returned an unexpected audio range")
-                        }
-                        if (partialRange != null && expectedContentLength != null &&
-                            partialRange.total != expectedContentLength
-                        ) {
-                            throw DownloadProtocolException(
-                                "Download size changed: expected $expectedContentLength, received ${partialRange.total}",
-                            )
-                        }
+            val totalLength = partialRange?.total
+                ?: responseLength
+                ?: expectedContentLength?.takeIf { it > 0L }
+                ?: -1L
+            if (responseLength != null && expectedContentLength != null &&
+                currentResponse.code == 200 && responseLength != expectedContentLength
+            ) {
+                throw DownloadProtocolException(
+                    "Download size changed: expected $expectedContentLength, received $responseLength",
+                )
+            }
 
-                        val totalLength = partialRange?.total
-                            ?: responseLength
-                            ?: expectedContentLength?.takeIf { it > 0L }
-                            ?: -1L
-                        if (responseLength != null && expectedContentLength != null &&
-                            currentResponse.code == 200 && responseLength != expectedContentLength
-                        ) {
-                            throw DownloadProtocolException(
-                                "Download size changed: expected $expectedContentLength, received $responseLength",
-                            )
+            val append = resumeOffset > 0L && partialRange != null
+            var downloadedBytes = if (append) resumeOffset else 0L
+            FileOutputStream(target, append).use { output ->
+                body.byteStream().use { input ->
+                    val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                    while (true) {
+                        if (!isActive()) throw CancellationException("Download cancelled")
+                        val read = try {
+                            input.read(buffer)
+                        } catch (error: IOException) {
+                            throw DownloadInterruptedException("Connection interrupted while reading audio", error)
                         }
-
-                        val append = resumeOffset > 0L && partialRange != null
-                        var downloadedBytes = if (append) resumeOffset else 0L
-                        FileOutputStream(target, append).use { output ->
-                            body.byteStream().use { input ->
-                                val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
-                                while (true) {
-                                    if (!continuation.isActive) throw CancellationException("Download cancelled")
-                                    val read = try {
-                                        input.read(buffer)
-                                    } catch (error: IOException) {
-                                        throw DownloadInterruptedException("Connection interrupted while reading audio", error)
-                                    }
-                                    if (read < 0) break
-                                    output.write(buffer, 0, read)
-                                    downloadedBytes += read
-                                    onProgress(downloadedBytes, totalLength)
-                                }
-                            }
-                            output.flush()
-                            output.fd.sync()
-                        }
-                        if (downloadedBytes < MIN_VALID_AUDIO_BYTES) {
-                            throw DownloadProtocolException("Downloaded audio payload is too small")
-                        }
-                        if (totalLength > 0L && downloadedBytes != totalLength) {
-                            if (downloadedBytes < totalLength) {
-                                throw DownloadInterruptedException(
-                                    "Download truncated: received $downloadedBytes of $totalLength bytes",
-                                )
-                            }
-                            throw DownloadProtocolException(
-                                "Download exceeded expected size: received $downloadedBytes of $totalLength bytes",
-                            )
-                        }
-
-                        DownloadTransfer(
-                            bytesDownloaded = downloadedBytes,
-                            totalBytes = totalLength.takeIf { it > 0L } ?: downloadedBytes,
-                            contentType = currentResponse.header("Content-Type").orEmpty(),
-                        )
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        downloadedBytes += read
+                        onProgress(downloadedBytes, totalLength)
                     }
-                    if (continuation.isActive) continuation.resume(transfer)
-                } catch (error: Exception) {
-                    if (continuation.isActive) continuation.resumeWithException(error)
                 }
+                output.flush()
+                output.fd.sync()
             }
-        })
+            if (downloadedBytes < MIN_VALID_AUDIO_BYTES) {
+                throw DownloadProtocolException("Downloaded audio payload is too small")
+            }
+            if (totalLength > 0L && downloadedBytes != totalLength) {
+                if (downloadedBytes < totalLength) {
+                    throw DownloadInterruptedException(
+                        "Download truncated: received $downloadedBytes of $totalLength bytes",
+                    )
+                }
+                throw DownloadProtocolException(
+                    "Download exceeded expected size: received $downloadedBytes of $totalLength bytes",
+                )
+            }
+
+            DownloadTransfer(
+                bytesDownloaded = downloadedBytes,
+                totalBytes = totalLength.takeIf { it > 0L } ?: downloadedBytes,
+                contentType = currentResponse.header("Content-Type").orEmpty(),
+            )
+        }
     }
 
     private data class ParsedDashManifest(
@@ -3092,9 +3114,8 @@ class TrackDownloadManager @Inject constructor(
         if (!keepResult || _downloads.value[key] == null) retryRequests.remove(key)
     }
 
-    /** Worker that already holds a slot must release it exactly once. */
-    private fun abandonAcquiredDownload(key: String) {
-        runCatching { downloadSlots.release() }
+    /** The pipeline lease owns all permits, including on an early return. */
+    private fun abandonDownload(key: String) {
         activeUris.remove(key)?.let { uri ->
             runCatching { context.contentResolver.delete(uri, null, null) }
         }

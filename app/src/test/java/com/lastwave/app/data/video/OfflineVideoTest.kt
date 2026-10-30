@@ -9,7 +9,15 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
@@ -27,12 +35,13 @@ class OfflineVideoTest {
     private val context: Context = RuntimeEnvironment.getApplication()
     private val youtube = mockk<YouTubeStreamExtractor>()
     private val live = PlayableTrack("Song LIVE", "Artist", videoId = "live1234567")
-    private fun repository(failAudio: Boolean = false): TrackVideoRepository {
+    private fun repository(failAudio: Boolean = false, onRequest: (Boolean) -> Unit = {}): TrackVideoRepository {
         context.getSharedPreferences("lastwave_track_videos", Context.MODE_PRIVATE).edit().clear().commit()
         File(context.filesDir, "offline-videos").deleteRecursively()
         val http = OkHttpClient.Builder().addInterceptor { chain ->
             val request = chain.request()
             val audio = request.url.encodedPath == "/audio"
+            onRequest(audio)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1)
                 .code(if (audio && failAudio) 500 else 200).message("test")
                 .body((if (audio) "original live soundtrack" else "original live video").toResponseBody()).build()
@@ -76,6 +85,65 @@ class OfflineVideoTest {
         assertEquals("https://www.youtube.com/watch?v=other123456", repo.sourceFor(live))
         repo.remove(live)
         assertTrue(repo.hasOfflineVideo(live))
+    }
+
+    @Test fun adaptiveVideoAndItsOwnSoundtrackTransferInParallel() = runBlocking {
+        val entered = CountDownLatch(2)
+        val repo = repository(onRequest = {
+            entered.countDown()
+            check(entered.await(5, TimeUnit.SECONDS)) { "Video and soundtrack were serialized" }
+        })
+        withTimeout(10_000) { repo.downloadVideo(live, emptyList()) { } }
+        assertTrue(repo.hasOfflineVideo(live))
+    }
+
+    @Test fun stagedPairIsInvisibleUntilPublishedAndClosingUnpublishedPairRemovesFiles() = runBlocking {
+        val repo = repository()
+        val pending = repo.prepareDownload(live)
+        try {
+            pending.transfer { }
+            assertFalse(repo.hasOfflineVideo(live))
+            assertTrue(File(context.filesDir, "offline-videos").listFiles().orEmpty().isNotEmpty())
+        } finally { pending.close() }
+        assertTrue(File(context.filesDir, "offline-videos").listFiles().orEmpty().isEmpty())
+        val completed = repo.prepareDownload(live)
+        try {
+            assertTrue(runCatching { completed.publish(emptyList()) }.isFailure)
+            completed.transfer { }
+            completed.publish(listOf("/music/live.opus"))
+        } finally { completed.close() }
+        assertTrue(repo.hasOfflineVideo(live))
+    }
+
+    @Test fun cancellationWaitsForNativeCallbacksBeforeRemovingStagedFiles() = runBlocking {
+        val entered = CountDownLatch(2)
+        val release = CountDownLatch(1)
+        val repo = repository(onRequest = {
+            entered.countDown()
+            check(release.await(10, TimeUnit.SECONDS))
+        })
+        val job = launch(Dispatchers.Default) { repo.downloadVideo(live, emptyList()) { } }
+        try {
+            assertTrue(withContext(Dispatchers.IO) { entered.await(5, TimeUnit.SECONDS) })
+            job.cancel()
+            delay(50)
+            assertFalse("Cleanup must join callbacks, not race their file writes", job.isCompleted)
+        } finally {
+            release.countDown()
+            withTimeout(5_000) { job.cancelAndJoin() }
+        }
+        assertFalse(repo.hasOfflineVideo(live))
+        assertTrue(File(context.filesDir, "offline-videos").listFiles().orEmpty().isEmpty())
+    }
+
+    @Test fun failedVideoNeverDeletesAlreadySavedAudio() = runBlocking {
+        val repo = repository(failAudio = true)
+        val audio = File(context.filesDir, "completed-song.opus").apply { writeText("saved audio") }
+        try {
+            assertTrue(runCatching { repo.downloadVideo(live, listOf(audio.absolutePath)) { } }.isFailure)
+            assertEquals("saved audio", audio.readText())
+            assertFalse(repo.hasOfflineVideo(live))
+        } finally { audio.delete() }
     }
 
     @Test fun oneConcertCanHaveDifferentSongSegments() {
