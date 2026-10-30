@@ -96,7 +96,11 @@ jobs:
           "$(dirname "$apksigner")/aapt" dump badging "$apk" | grep -F "package: name='$expected_package'"
           sha256sum "$apk" > "$apk.sha256"
           if [ "$expected_package" = com.lastwave.app.custom.updates ]; then
-            python3 tools/publish-managed-update.py prepare --apk "$apk" --aapt "$(dirname "$apksigner")/aapt" --apksigner "$apksigner" --channel "$MANAGED_CHANNEL" --code "$MANAGED_VERSION_CODE" --source "$GITHUB_SHA"
+            apksig=$(find "$HOME/.gradle/caches/modules-2/files-2.1/com.android.tools.build/apksig" -name '*.jar' | sort -V | tail -n 1)
+            test -n "$apksig"
+            mkdir -p "$RUNNER_TEMP/managed-apk-verifier"
+            javac --release 17 -cp "$apksig" -d "$RUNNER_TEMP/managed-apk-verifier" tools/VerifyManagedApk.java
+            python3 tools/publish-managed-update.py prepare --apk "$apk" --aapt "$(dirname "$apksigner")/aapt" --verifier-classpath "$RUNNER_TEMP/managed-apk-verifier:$apksig" --channel "$MANAGED_CHANNEL" --code "$MANAGED_VERSION_CODE" --source "$GITHUB_SHA"
           fi
       - name: Upload test reports
         if: always()

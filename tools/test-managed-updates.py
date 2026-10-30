@@ -17,15 +17,6 @@ def release(channel, code, cert="b" * 64):
 
 
 class PublishingPolicyTest(unittest.TestCase):
-    def test_numbered_and_sdk_scoped_signer_output_excludes_source_stamp(self):
-        pin = "a" * 64
-        self.assertEqual({pin}, publisher.signer_fingerprints(f"Signer #1 certificate SHA-256 digest: {pin}\n"))
-        output = (f"Signer (minSdkVersion=33, maxSdkVersion=2147483647) certificate SHA-256 digest: {pin}\n"
-                  f"Signer (minSdkVersion=29, maxSdkVersion=32) certificate SHA-256 digest: {pin}\n"
-                  f"Source Stamp Signer certificate SHA-256 digest: {'b' * 64}\n")
-        self.assertEqual({pin}, publisher.signer_fingerprints(output))
-        self.assertEqual({pin, "c" * 64}, publisher.signer_fingerprints(output + f"Signer #2 certificate SHA-256 digest: {'c' * 64}\n"))
-
     def test_bootstrap_and_automatic_channel_promotion(self):
         test = publisher.advance_feed(None, release("test", 100), "test", True)
         stable = publisher.advance_feed(test, release("stable", 101), "stable", True)

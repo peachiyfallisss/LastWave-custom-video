@@ -64,6 +64,7 @@ tools/*
 !tools/setup-managed-updates.ps1
 !tools/publish-managed-update.py
 !tools/test-managed-updates.py
+!tools/VerifyManagedApk.java
 provider.js
 # Single raw provider source at repo base only (plaintext JSON, encrypted at build)
 provider.json
