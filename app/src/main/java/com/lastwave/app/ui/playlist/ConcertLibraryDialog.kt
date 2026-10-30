@@ -206,6 +206,9 @@ private fun ConcertPreview(concert: ConcertVideo, viewModel: ConcertLibraryViewM
     val progress by player.progressState.collectAsStateWithLifecycle()
     val active = mode.source == concert.source && mode.enabled
     val pending = mode.loading && playback.current?.videoSourceUrl == concert.source
+    val needsMappingRefresh = active && playback.current?.concertId == concert.id &&
+        (playback.current?.concertSegments != concert.segments ||
+            (concert.segments.isEmpty() && playback.current?.videoId != concert.wholeVideoSong?.youtubeVideoId))
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(20.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest), contentAlignment = Alignment.Center) {
             if (active && showVideo) TrackVideoSurface(player, playback.isPlaying, Modifier.fillMaxSize())
@@ -222,11 +225,19 @@ private fun ConcertPreview(concert: ConcertVideo, viewModel: ConcertLibraryViewM
                     onValueChange = { player.seekTo(it.toLong()) }, valueRange = 0f..progress.durationMs.coerceAtLeast(1).toFloat(), modifier = Modifier.weight(1f))
                 Text(formatConcertTime(progress.positionMs + (mode.segmentStartMs ?: 0)), style = MaterialTheme.typography.labelMedium)
             }
-            val currentSong = concert.segments.firstOrNull { (progress.positionMs + (mode.segmentStartMs ?: 0)) in it.startMs until it.endMs }
-            currentSong?.let { Text("Now linked: ${it.artist} — ${it.title}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
+            val currentSong = playback.current?.concertSegments?.firstOrNull { progress.positionMs in it.startMs until it.endMs }
+            if (mode.segmentStartMs != null) Text("Previewing: ${playback.current?.title.orEmpty()}", style = MaterialTheme.typography.bodySmall)
+            else currentSong?.let { Text("Now linked: ${it.artist} — ${it.title}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
         }
-        if (!active || mode.segmentStartMs != null) Button(enabled = !pending, onClick = { viewModel.playFull(concert) }, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Filled.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text(if (active && mode.segmentStartMs != null) "Return to full show" else "Play full show")
+        if (needsMappingRefresh) Text("Setlist changed. Apply it to refresh the playing song links; your position is kept.", style = MaterialTheme.typography.bodySmall)
+        if (!active || mode.segmentStartMs != null || needsMappingRefresh) Button(enabled = !pending, onClick = {
+            viewModel.playFull(concert, if (needsMappingRefresh) viewModel.sourcePosition(concert) ?: 0L else 0L)
+        }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Filled.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text(when {
+                needsMappingRefresh -> "Apply updated setlist"
+                active && mode.segmentStartMs != null -> "Return to full show"
+                else -> "Play full show"
+            })
         }
         if (active || playback.current?.videoSourceUrl == concert.source) mode.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }

@@ -58,6 +58,11 @@ projected into a separate listening identity at the absolute source playhead:
   concert video and its ordinary seekbar stay continuous. Lyric seeks are
   translated back into the concert's absolute timeline.
 - A whole-video song link is used only when no segment setlist is present.
+- Explicit device/external concert sources open directly, without first finding
+  a song-audio stream. A failed video is not replaced by a studio recording.
+- Editing the currently playing setlist shows **Apply updated setlist**. This
+  refreshes the playback snapshot at the current absolute position; the UI does
+  not pretend newly saved mappings are already active before they are applied.
 - No parallel muted YouTube playback is introduced. The existing connected
   account, opt-in, thresholds, and offline YouTube submission mechanisms remain
   in place. A submission does not establish remote history visibility or badge

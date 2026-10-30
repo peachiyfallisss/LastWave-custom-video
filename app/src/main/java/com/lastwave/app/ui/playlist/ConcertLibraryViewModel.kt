@@ -123,7 +123,7 @@ class ConcertLibraryViewModel @Inject constructor(
         if (track == null) "Whole-video link removed." else "Entire recording linked. Play full video to use this song identity."
     }
 
-    fun playFull(concert: ConcertVideo) {
+    fun playFull(concert: ConcertVideo, startPositionMs: Long = 0L) {
         val linked = concert.wholeVideoSong
         musicPlayer.play(
             PlayableTrack(
@@ -138,6 +138,7 @@ class ConcertLibraryViewModel @Inject constructor(
             ),
             sourceLabel = "Concert: ${concert.title}",
             startRadio = false,
+            startPositionMs = startPositionMs,
         )
     }
 

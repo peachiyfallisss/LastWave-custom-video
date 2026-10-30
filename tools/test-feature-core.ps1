@@ -44,14 +44,16 @@ try {
         'app/src/main/java/com/lastwave/app/data/lyrics/CustomLyrics.kt',
         'app/src/main/java/com/lastwave/app/data/lyrics/LyricsTranslation.kt',
         'app/src/main/java/com/lastwave/app/playback/ConcertListeningState.kt',
+        'app/src/main/java/com/lastwave/app/playback/InitialPlaybackSource.kt',
         'app/src/main/java/com/lastwave/app/data/download/DownloadEnrichment.kt',
         'app/src/test/java/com/lastwave/app/data/lyrics/CustomLyricsTest.kt',
         'app/src/test/java/com/lastwave/app/playback/ConcertListeningStateTest.kt',
+        'app/src/test/java/com/lastwave/app/playback/InitialPlaybackSourceTest.kt',
         'app/src/test/java/com/lastwave/app/data/download/DownloadEnrichmentTest.kt'
     ) | ForEach-Object { if ([IO.Path]::IsPathRooted($_)) { $_ } else { Join-Path $repo $_ } }
     & java -cp "$KotlinLib\*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -no-reflect -classpath $classpath -d "$temp\classes" @sources
     if ($LASTEXITCODE -ne 0) { throw 'Portable feature-core compilation failed.' }
-    & java -cp "$temp\classes;$classpath" org.junit.runner.JUnitCore com.lastwave.app.data.lyrics.CustomLyricsTest com.lastwave.app.playback.ConcertListeningStateTest com.lastwave.app.data.download.DownloadEnrichmentTest
+    & java -cp "$temp\classes;$classpath" org.junit.runner.JUnitCore com.lastwave.app.data.lyrics.CustomLyricsTest com.lastwave.app.playback.ConcertListeningStateTest com.lastwave.app.playback.InitialPlaybackSourceTest com.lastwave.app.data.download.DownloadEnrichmentTest
     if ($LASTEXITCODE -ne 0) { throw 'Feature-core tests failed.' }
 } finally {
     $resolved = [IO.Path]::GetFullPath($temp)
