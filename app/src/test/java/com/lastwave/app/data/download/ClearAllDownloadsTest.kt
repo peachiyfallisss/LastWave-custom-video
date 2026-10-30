@@ -169,6 +169,30 @@ class ClearAllDownloadsTest {
     }
 
     @Test
+    fun immediateCancellationCannotStrandQueuedAdmissionKeys() = runBlocking {
+        coEvery { dao.findByTrackKey(any()) } coAnswers { suspendCancellableCoroutine { } }
+        repeat(30) { index ->
+            manager.downloadTrack("Immediate $index", "Artist")
+            manager.cancelDownload("Immediate $index", "Artist")
+        }
+        withTimeout(5_000) {
+            while (manager.activeJobs().isNotEmpty() || manager.activeKeys().isNotEmpty()) {
+                kotlinx.coroutines.delay(10)
+            }
+        }
+        assertThat(manager.downloads.value).isEmpty()
+        val resumed = CompletableDeferred<Unit>()
+        coEvery { dao.findByTrackKey(any()) } coAnswers {
+            resumed.complete(Unit)
+            suspendCancellableCoroutine { }
+        }
+        manager.downloadTrack("Immediate 0", "Artist")
+        withTimeout(5_000) { resumed.await() }
+        manager.clearAllDownloads()
+        assertThat(manager.activeKeys()).isEmpty()
+    }
+
+    @Test
     fun clearAllDownloads_joinsActiveAndQueuedWorkersBeforeEnumerating() = runBlocking {
         val activeHeld = CompletableDeferred<Unit>()
         coEvery { dao.findByTrackKey(any()) } coAnswers {

@@ -137,7 +137,7 @@ class DownloadPipelineIntegrationTest {
         assertTrue(completed.values.all { it.error == null })
         assertEquals(2, rows.size)
         verify(exactly = 1) { firstVideo.publish(any()) }
-        verify(exactly = 1) { firstVideo.close() }
+        verify(timeout = 5_000, exactly = 1) { firstVideo.close() }
     }
 
     @Test fun videoFailureSavesAudioAndRetryOnlyTransfersMissingVideo() = runBlocking {

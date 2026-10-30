@@ -482,6 +482,20 @@ class TrackDownloadManager @Inject constructor(
                 }
             }
             activeJobs[key] = job
+            job.invokeOnCompletion {
+                // A scheduled LAZY job can be cancelled before its body ever
+                // runs. Its catch/finally cannot clean the admission key then.
+                synchronized(admissionLock) {
+                    if (activeJobs.remove(key, job)) {
+                        activeKeys.remove(key)
+                        reconnectGenerations.remove(key)
+                        if (job.isCancelled) {
+                            retryRequests.remove(key)
+                            _downloads.update { it - key }
+                        }
+                    }
+                }
+            }
             job.start()
         }
     }
