@@ -7,10 +7,13 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
 /** FIFO permits with a live limit. Lowering it lets current transfers finish. */
-internal class DownloadConcurrencyLimiter(initialLimit: Int = DEFAULT_LIMIT) {
+internal class DownloadConcurrencyLimiter(
+    initialLimit: Int = DEFAULT_LIMIT,
+    private val maximumLimit: Int = MAX_LIMIT,
+) {
     private val lock = Any()
     private val waiting = ArrayDeque<CompletableDeferred<Unit>>()
-    private var limit = initialLimit.coerceIn(1, MAX_LIMIT)
+    private var limit = initialLimit.coerceIn(1, maximumLimit)
     private var active = 0
 
     suspend fun acquire() {
@@ -39,7 +42,7 @@ internal class DownloadConcurrencyLimiter(initialLimit: Int = DEFAULT_LIMIT) {
     }
 
     fun setLimit(value: Int) = synchronized(lock) {
-        limit = value.coerceIn(1, MAX_LIMIT)
+        limit = value.coerceIn(1, maximumLimit)
         drain()
     }
 

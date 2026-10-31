@@ -6,6 +6,7 @@
         tools:overrideLibrary="com.mocharealm.accompanist.lyrics.ui, com.mocharealm.accompanist.lyrics.core, com.decent.usbaudio" />
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -42,7 +43,7 @@
         android:appCategory="audio"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="@string/app_name"
+        android:label="${appLabel}"
         android:supportsRtl="true"
         android:theme="@style/Theme.LastWave.Splash"
         android:usesCleartextTraffic="false"
@@ -51,6 +52,7 @@
         android:largeHeap="true"
         android:enableOnBackInvokedCallback="true">
 
+        <meta-data android:name="lastwave.update.DATA_SCHEMA" android:value="${updateDataSchema}" />
         <meta-data
             android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
             android:value="com.lastwave.app.playback.cast.LastWaveCastOptionsProvider" />

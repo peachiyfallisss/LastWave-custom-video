@@ -124,7 +124,7 @@ class YtMusicHistorySyncManager @Inject constructor(
                     activeAccount = account
                     historyEnabled = enabled
                 }
-                onPlayerState(state)
+                onPlayerState(com.lastwave.app.playback.concertListeningState(state))
             }
         }
     }
@@ -137,7 +137,7 @@ class YtMusicHistorySyncManager @Inject constructor(
         val previouslyPlaying = wasPlaying
         wasPlaying = advancing
         val track = s.current
-        val key = track?.let { "${s.currentIndex}|${it.title}|${it.artist}|${it.album}|${it.videoId}|${it.playbackUrl}" }
+        val key = track?.let { "${s.currentIndex}|${s.listeningSessionKey}|${it.title}|${it.artist}|${it.album}|${it.videoId}|${it.playbackUrl}" }
         val switched = s.sourceSwitchSerial != lastSourceSwitchSerial
         if (switched) {
             lastSourceSwitchSerial = s.sourceSwitchSerial

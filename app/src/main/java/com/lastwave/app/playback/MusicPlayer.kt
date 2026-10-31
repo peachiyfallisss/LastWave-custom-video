@@ -122,6 +122,8 @@ data class PlayableTrack(
     val videoSourceUrl: String? = null,
     val videoSegmentStartMs: Long? = null,
     val videoSegmentEndMs: Long? = null,
+    val concertId: String? = null,
+    val concertSegments: List<com.lastwave.app.data.video.ConcertSongSegment> = emptyList(),
 )
 
 @Serializable
@@ -173,6 +175,8 @@ data class MusicPlayerState(
     val error: String? = null,
     /** Changes source without opening a new listening session for this song. */
     val sourceSwitchSerial: Long = 0L,
+    /** Attribution session only; never used to reopen or replace the playing media. */
+    val listeningSessionKey: String? = null,
 )
 
 /**
@@ -1863,6 +1867,7 @@ class MusicPlayer @Inject constructor(
         track: PlayableTrack,
         sourceLabel: String = "LastWave",
         startRadio: Boolean = true,
+        startPositionMs: Long = 0L,
     ) {
         pendingRestoredSession = null
         disableDiscoverQueue()
@@ -1877,7 +1882,7 @@ class MusicPlayer @Inject constructor(
         startResolvedQueuePlayback(
             tracks = listOf(track),
             selectedIndex = 0,
-            startPositionMs = 0L,
+            startPositionMs = startPositionMs.coerceAtLeast(0L),
             sourceLabel = sourceLabel,
             endlessDiscover = false,
         )
@@ -1944,6 +1949,8 @@ class MusicPlayer @Inject constructor(
         startShuffled: Boolean = false,
     ) {
         val selectedTrack = tracks[selectedIndex].withYoutubeArtwork()
+        val selectedVideoSource = selectedTrack.videoSourceUrl?.takeIf(String::isNotBlank)
+        val selectedVideoSegment = selectedVideoSource?.let { videoSegment(selectedTrack) }
         if (isCasting) {
             onMain {
                 cancelPendingPlaybackResolution()
@@ -1966,7 +1973,10 @@ class MusicPlayer @Inject constructor(
         onMain {
             if (generation != playRequestGeneration.get()) return@onMain
             ensureForegroundService()
-            _videoState.value = VideoPlaybackState()
+            _videoState.value = if (selectedVideoSource != null) VideoPlaybackState(
+                mediaId = selectedTrack.mediaIdKey(), source = selectedVideoSource,
+                loading = true, requestedVideo = true,
+            ) else VideoPlaybackState()
             cancelCrossfade()
             losslessBypassMediaIds.clear()
             errorRetryCount = 0
@@ -1999,19 +2009,32 @@ class MusicPlayer @Inject constructor(
         }
         playRequest = applicationScope.launch(Dispatchers.IO) {
             try {
-                val resolved = if (selectedTrack.playbackUrl == null) {
-                    resolveTrackAudioStreamWithRetry(
-                        track = selectedTrack,
-                        videoId = selectedTrack.videoId,
-                        allowLossless = selectedTrack.mediaIdKey() !in losslessBypassMediaIds,
-                    )
-                } else {
-                    null
+                val resolved = resolveInitialPlaybackSource(
+                    videoSource = selectedVideoSource,
+                    resolveVideo = { resolvePlaybackVideo(selectedTrack.mediaIdKey(), it) },
+                    resolveAudio = {
+                        if (selectedTrack.playbackUrl == null) resolveTrackAudioStreamWithRetry(
+                            track = selectedTrack,
+                            videoId = selectedTrack.videoId,
+                            allowLossless = selectedTrack.mediaIdKey() !in losslessBypassMediaIds,
+                        ) else null
+                    },
+                )
+                if (selectedVideoSegment != null && resolved?.durationMs != null && selectedVideoSegment.endMs > resolved.durationMs) {
+                    throw IllegalArgumentException("The segment end is past the selected video's duration.")
                 }
                 currentCoroutineContext().ensureActive()
                 if (generation != playRequestGeneration.get()) return@launch
                 withContext(Dispatchers.Main.immediate) {
                     if (generation != playRequestGeneration.get()) return@withContext
+                    if (selectedVideoSource != null && resolved != null) {
+                        _videoState.value = VideoPlaybackState(
+                            mediaId = selectedTrack.mediaIdKey(), source = selectedVideoSource, enabled = true,
+                            segmentStartMs = selectedVideoSegment?.startMs, segmentEndMs = selectedVideoSegment?.endMs,
+                        )
+                        rememberPlaybackModeStream(selectedTrack.mediaIdKey(), selectedVideoSource, resolved)
+                        _state.update { it.copy(durationMs = selectedVideoSegment?.durationMs ?: resolved.durationMs ?: it.durationMs) }
+                    }
                     val isShuffle = startShuffled || (playerDelegate.isInitialized() && player.shuffleModeEnabled)
                     resolved?.let {
                         registerPreparedStream(it)
@@ -2019,13 +2042,14 @@ class MusicPlayer @Inject constructor(
                         publishResolvedQuality(it, expectedMediaId = selectedTrack.mediaIdKey())
                         applyDacRoutingFor(dacRateFor(it))
                         logStreamEvent("player-prepare", it, retry = 0)
-                        cacheCurrentTrackStream(it)
+                        if (selectedVideoSource == null) cacheCurrentTrackStream(it)
                     }
                     if (selectedTrack.playbackUrl != null) {
                         applicationScope.launch(Dispatchers.IO) { publishLocalTrackQuality(selectedTrack) }
                     }
                     val mediaItems = tracks.mapIndexed { index, track ->
-                        track.toMediaItem(if (index == selectedIndex) resolved else null)
+                        if (index == selectedIndex) track.toMediaItem(resolved, selectedVideoSegment?.startMs, selectedVideoSegment?.endMs)
+                        else track.toMediaItem()
                     }
                     resetPlayhead(startPositionMs, selectedTrack.mediaIdKey())
                     player.setMediaItems(mediaItems, selectedIndex, startPositionMs.coerceAtLeast(0L))
@@ -2049,7 +2073,7 @@ class MusicPlayer @Inject constructor(
                     extendRadioQueueIfNeeded(selectedIndex)
                     preloadNextQueueItem(selectedIndex)
                     resolved?.let { stream ->
-                        if (!stream.isLossless && stream.audioCodec != "DOLBY ATMOS") {
+                        if (selectedVideoSource == null && !stream.isLossless && stream.audioCodec != "DOLBY ATMOS") {
                             scheduleQualityUpgrade(
                                 track = selectedTrack,
                                 expectedMediaId = selectedTrack.mediaIdKey(),
@@ -2065,7 +2089,7 @@ class MusicPlayer @Inject constructor(
                 currentCoroutineContext().ensureActive()
                 if (generation != playRequestGeneration.get()) return@launch
                 logResolutionFailure(selectedTrack, "resolve-before-prepare", 0, error)
-                if (selectedTrack.mediaIdKey() !in losslessBypassMediaIds) {
+                if (selectedVideoSource == null && selectedTrack.mediaIdKey() !in losslessBypassMediaIds) {
                     losslessBypassMediaIds += selectedTrack.mediaIdKey()
                     val ytFallback = try {
                         resolveYoutubeTrackAudioStream(selectedTrack, selectedTrack.videoId)
@@ -2146,8 +2170,9 @@ class MusicPlayer @Inject constructor(
                             val userMessage = if (isOffline) {
                                 "Track not available offline"
                             } else {
-                                error.message ?: "Unable to resolve audio"
+                                error.message ?: if (selectedVideoSource != null) "Unable to open the concert video" else "Unable to resolve audio"
                             }
+                            if (selectedVideoSource != null) _videoState.update { it.copy(loading = false, requestedVideo = null, error = userMessage) }
                             _state.update {
                                 it.copy(
                                     isPlaying = false,
@@ -5092,6 +5117,8 @@ class MusicPlayer @Inject constructor(
         val expiresAtEpochMs: Long? = null,
         /** Soundtrack belonging to a video-only adaptive stream, never the catalog audio. */
         val companionAudio: ResolvedStream? = null,
+        /** Actual selected video rendition; diagnostic metadata only. */
+        val videoHeight: Int? = null,
     )
 
     private fun isNetworkException(error: Throwable): Boolean {

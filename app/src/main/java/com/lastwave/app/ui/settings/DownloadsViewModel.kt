@@ -335,6 +335,9 @@ class DownloadsViewModel @Inject constructor(
         }
     }
 
+    fun retryDownload(key: String) = downloadManager.retryDownload(key)
+    fun reconnectDownload(key: String) { downloadManager.reconnectDownload(key) }
+
     fun cancelAllDownloads() {
         try {
             downloadManager.cancelAllDownloads()

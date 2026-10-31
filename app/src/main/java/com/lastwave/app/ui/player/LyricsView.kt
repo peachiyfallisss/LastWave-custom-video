@@ -128,6 +128,8 @@ fun LyricsPanel(
     state: MusicPlayerState,
     player: MusicPlayer,
     lyricsState: LyricsUiState,
+    onEditLyrics: (() -> Unit)? = null,
+    seekOffsetMs: Long = 0L,
     progressState: StateFlow<PlaybackProgressState>? = null,
     lyricsAnimation: LyricsAnimation = LyricsAnimation.APPLE_FLUID,
     wavySeekbarEnabled: Boolean = true,
@@ -194,6 +196,7 @@ fun LyricsPanel(
     Column(
         modifier = modifier.fillMaxSize(),
     ) {
+        if (onEditLyrics != null) TextButton(onClick = onEditLyrics) { Text("Edit lyrics / translation") }
         // Weighted layout only: deliberately no card, background, border, or shadow.
         AnimatedContent(
             targetState = lyricsState,
@@ -279,6 +282,7 @@ fun LyricsPanel(
 
         // Transparent playback controls; no separate player-bar container.
         LyricsPlaybackControls(
+            seekOffsetMs = seekOffsetMs,
             state = state,
             currentPositionMs = smoothedPositionMs,
             totalDurationMs = if (progress.durationMs > 0) progress.durationMs else state.durationMs,
@@ -701,6 +705,9 @@ private fun WordByWordLyricLine(
                     textAlign = TextAlign.Start,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (!line.translation.isNullOrBlank()) {
+                    TranslatedLyricText(line.translation, lineColor.copy(alpha = 0.75f))
+                }
                 if (!line.transliteration.isNullOrBlank() && isActive) {
                     val transliterationRtl = isRtlText(line.transliteration)
                     CompositionLocalProvider(
@@ -854,6 +861,9 @@ private fun WordByWordLyricLine(
                 }
             }
 
+            if (!line.translation.isNullOrBlank()) {
+                TranslatedLyricText(line.translation, activeColor.copy(alpha = 0.75f))
+            }
             if (!line.transliteration.isNullOrBlank()) {
                 val transliterationRtl = isRtlText(line.transliteration)
                 CompositionLocalProvider(
@@ -982,6 +992,7 @@ private fun EmptyLyricsView(
 
 @Composable
 private fun LyricsPlaybackControls(
+    seekOffsetMs: Long = 0L,
     state: MusicPlayerState,
     currentPositionMs: Long,
     totalDurationMs: Long,
@@ -1258,7 +1269,7 @@ private fun LyricsPlaybackControls(
                     val target = (lastSeekValue ?: dragValue)?.toLong()
                     dragValue = null
                     lastSeekValue = null
-                    if (target != null) player.seekTo(target)
+                    if (target != null) player.seekTo(target + seekOffsetMs)
                 },
                 valueRange = 0f..end,
                 enabled = totalDurationMs > 0,

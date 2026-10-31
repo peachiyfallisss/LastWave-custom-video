@@ -114,6 +114,8 @@ fun ModernLyricsPanel(
     state: MusicPlayerState,
     player: MusicPlayer,
     lyricsState: LyricsUiState,
+    onEditLyrics: (() -> Unit)? = null,
+    seekOffsetMs: Long = 0L,
     progressState: StateFlow<PlaybackProgressState>? = null,
     wavySeekbarEnabled: Boolean = true,
     onToggleFullscreen: (() -> Unit)? = null,
@@ -176,6 +178,7 @@ fun ModernLyricsPanel(
     }
 
     Column(modifier = modifier.fillMaxSize()) {
+        if (onEditLyrics != null) TextButton(onClick = onEditLyrics) { Text("Edit lyrics / translation") }
         AnimatedContent(
             targetState = lyricsState,
             transitionSpec = {
@@ -300,6 +303,7 @@ fun ModernLyricsPanel(
                                     }
                                 }
                                 KaraokeLineWrapScope(
+                                    seekOffsetMs = seekOffsetMs,
                                     lines = targetState.lines,
                                     isOverallRtl = isOverallRtl,
                                     trackTitle = track.title,
@@ -336,6 +340,7 @@ fun ModernLyricsPanel(
         }
 
         ModernLyricsControls(
+            seekOffsetMs = seekOffsetMs,
             state = state,
             currentPositionMs = smoothedPositionMs,
             totalDurationMs = if (progress.durationMs > 0) progress.durationMs else state.durationMs,
@@ -378,6 +383,7 @@ private val KaraokeHorizontalChrome = 56.dp
  */
 @Composable
 private fun KaraokeLineWrapScope(
+    seekOffsetMs: Long = 0L,
     lines: List<LyricLine>,
     isOverallRtl: Boolean,
     trackTitle: String,
@@ -437,7 +443,7 @@ private fun KaraokeLineWrapScope(
             currentPosition = currentPosition,
             onLineClicked = { line ->
                 // Inverse of the highlight shift: tap targets audio time.
-                player.seekTo((line.start - lyricsOffsetMs).coerceAtLeast(0).toLong())
+                player.seekTo((line.start - lyricsOffsetMs).coerceAtLeast(0).toLong() + seekOffsetMs)
             },
             onLinePressed = {},
             modifier = Modifier
@@ -541,7 +547,7 @@ private fun LyricLine.toISyncedLine(isOverallRtl: Boolean = false): ISyncedLine 
 
         KaraokeLine.MainKaraokeLine(
             syllables = mainSyllables,
-            translation = null,
+            translation = translation,
             phonetic = transliteration,
             alignment = if (isLineRtl) KaraokeAlignment.End else KaraokeAlignment.Start,
             start = effectiveStart,
@@ -553,7 +559,7 @@ private fun LyricLine.toISyncedLine(isOverallRtl: Boolean = false): ISyncedLine 
             start = lineStart,
             end = lineEnd.coerceAtLeast(lineStart + 100),
             content = text,
-            translation = transliteration,
+            translation = listOfNotNull(translation, transliteration).joinToString("\n").takeIf { it.isNotBlank() },
         )
     }
 }
@@ -672,6 +678,7 @@ private fun ModernEmptyLyricsView(
 
 @Composable
 private fun ModernLyricsControls(
+    seekOffsetMs: Long = 0L,
     state: MusicPlayerState,
     currentPositionMs: Long,
     totalDurationMs: Long,
@@ -945,7 +952,7 @@ private fun ModernLyricsControls(
                     val target = (lastSeekValue ?: dragValue)?.toLong()
                     dragValue = null
                     lastSeekValue = null
-                    if (target != null) player.seekTo(target)
+                    if (target != null) player.seekTo(target + seekOffsetMs)
                 },
                 valueRange = 0f..end,
                 enabled = totalDurationMs > 0,

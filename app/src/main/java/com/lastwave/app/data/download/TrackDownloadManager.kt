@@ -48,6 +48,8 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -60,15 +62,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import com.lastwave.app.data.video.TrackVideoRepository
 import com.lastwave.app.playback.PlayableTrack
 import kotlinx.coroutines.withContext
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
@@ -87,12 +86,11 @@ import java.net.SocketException
 import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 data class DownloadProgress(
     val key: String,
@@ -149,8 +147,10 @@ class TrackDownloadManager @Inject constructor(
     private val flacTranscoder: ModuleFlacTranscoder,
     private val losslessMusicApi: LosslessMusicApi,
     private val videoRepository: TrackVideoRepository,
+    private val downloadDiagnostics: DownloadDiagnostics = DownloadDiagnostics(),
 ) {
     private val downloadSourcePreferences = context.getSharedPreferences("lastwave_download_sources", Context.MODE_PRIVATE)
+    private val retryRequests = ConcurrentHashMap<String, () -> Unit>()
     companion object {
         const val CHANNEL_ID = "lastwave_downloads"
         const val ACTION_CANCEL_DOWNLOAD = "com.lastwave.app.ACTION_CANCEL_DOWNLOAD"
@@ -186,6 +186,8 @@ class TrackDownloadManager @Inject constructor(
     // read buffer, and unbounded pooling kept idle connections (and their
     // buffers) alive for minutes across successive downloads.
     private val downloadClient = okHttpClient.newBuilder()
+        .eventListenerFactory(downloadDiagnostics.listenerFactory)
+        .addNetworkInterceptor(downloadDiagnostics.networkInterceptor)
         .dispatcher(Dispatcher().apply {
             maxRequests = 24
             maxRequestsPerHost = 8
@@ -214,7 +216,9 @@ class TrackDownloadManager @Inject constructor(
     private val activeUris = ConcurrentHashMap<String, Uri>()
     private val activeFiles = ConcurrentHashMap<String, File>()
     private val reconnectGenerations = ConcurrentHashMap<String, AtomicLong>()
-    private val downloadSlots = DownloadConcurrencyLimiter()
+    private val downloadPipeline = DownloadPipeline(report = { event ->
+        android.util.Log.d("LastWaveDownloadPipeline", event.toString())
+    })
     private val downloadLimitReady = CompletableDeferred<Unit>()
 
     private val _downloads = MutableStateFlow<Map<String, DownloadProgress>>(emptyMap())
@@ -225,14 +229,14 @@ class TrackDownloadManager @Inject constructor(
         applicationScope.launch(Dispatchers.IO) {
             try {
                 settingsPreferences.settings.map { it.concurrentDownloads }.distinctUntilChanged().collect { count ->
-                    downloadSlots.setLimit(count)
+                    downloadPipeline.setLimit(count)
                     downloadLimitReady.complete(Unit)
                 }
             } catch (cancelled: CancellationException) {
                 downloadLimitReady.cancel(cancelled)
                 throw cancelled
             } catch (failure: Exception) {
-                downloadSlots.setLimit(DownloadConcurrencyLimiter.DEFAULT_LIMIT)
+                downloadPipeline.setLimit(DownloadConcurrencyLimiter.DEFAULT_LIMIT)
                 downloadLimitReady.complete(Unit)
                 android.util.Log.w("TrackDownloadManager", "Download limit preference unavailable; using default", failure)
             }
@@ -409,21 +413,17 @@ class TrackDownloadManager @Inject constructor(
     }
 
     fun cancelDownload(key: String) {
-        activeKeys.remove(key)
-        reconnectGenerations.remove(key)?.incrementAndGet()
-        val job = activeJobs.remove(key)
-        job?.cancel()
-
-        // Clean up partial media entry/file
-        activeUris.remove(key)?.let { uri ->
-            runCatching { context.contentResolver.delete(uri, null, null) }
+        synchronized(admissionLock) {
+            retryRequests.remove(key)
+            reconnectGenerations[key]?.incrementAndGet()
+            val job = activeJobs[key]
+            job?.cancel()
+            // Keep the key reserved until the worker has joined native readers and
+            // cleaned its own files. An immediate requeue must not race that cleanup.
+            if (job == null) abandonDownload(key)
+            notificationManager?.cancel(key.hashCode())
+            _downloads.update { it - key }
         }
-        activeFiles.remove(key)?.let { file ->
-            runCatching { if (file.exists()) file.delete() }
-        }
-
-        notificationManager?.cancel(key.hashCode())
-        _downloads.update { it - key }
     }
 
     fun cancelDownload(title: String, artist: String) {
@@ -443,6 +443,14 @@ class TrackDownloadManager @Inject constructor(
         return true
     }
 
+    fun retryDownload(key: String) {
+        val request = retryRequests[key] ?: return
+        applicationScope.launch {
+            activeJobs[key]?.join()
+            if (retryRequests[key] === request && _downloads.value[key]?.error != null) request()
+        }
+    }
+
     fun downloadTrack(
         title: String,
         artist: String,
@@ -460,11 +468,45 @@ class TrackDownloadManager @Inject constructor(
         synchronized(admissionLock) {
             if (downloadsWiping) return
             if (!activeKeys.add(key)) return
+            retryRequests[key] = { downloadTrack(title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl) }
+            updateProgress(DownloadProgress(key, title, artist, formatBadge = "Queued"))
             reconnectGenerations[key] = AtomicLong()
+            val diagnosticId = downloadDiagnostics.begin(key)
             val job = applicationScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl)
+                var enteredWorker = false
+                try {
+                    downloadLimitReady.await()
+                    downloadPipeline.run { lease ->
+                        enteredWorker = true
+                        coroutineScope {
+                            runDownloadJob(key, title, artist, album, artworkUrl, year, videoId, durationMs, includeVideo, playbackUrl, lease, diagnosticId)
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    if (!enteredWorker) forgetDownloadKey(key)
+                    throw cancelled
+                }
             }
             activeJobs[key] = job
+            job.invokeOnCompletion {
+                downloadDiagnostics.finish(key, diagnosticId, when {
+                    job.isCancelled -> "cancelled"
+                    _downloads.value[key]?.error != null -> "error"
+                    else -> "success"
+                })
+                // A scheduled LAZY job can be cancelled before its body ever
+                // runs. Its catch/finally cannot clean the admission key then.
+                synchronized(admissionLock) {
+                    if (activeJobs.remove(key, job)) {
+                        activeKeys.remove(key)
+                        reconnectGenerations.remove(key)
+                        if (job.isCancelled) {
+                            retryRequests.remove(key)
+                            _downloads.update { it - key }
+                        }
+                    }
+                }
+            }
             job.start()
         }
     }
@@ -480,20 +522,12 @@ class TrackDownloadManager @Inject constructor(
         durationMs: Long?,
         includeVideo: Boolean,
         playbackUrl: String?,
+        lease: DownloadPipeline.Lease,
+        diagnosticId: Long,
     ) {
-            // One permit covers this song's complete audio + optional video job.
-            // Queued jobs obey the current setting; running jobs finish when the limit shrinks.
-            // acquire() is cancellable; a cancel while queued must still
-            // release the key so the slot never strands.
-            try {
-                downloadLimitReady.await()
-                downloadSlots.acquire()
-            } catch (cancelled: CancellationException) {
-                forgetDownloadKey(key)
-                return
-            }
+            downloadDiagnostics.trace.worker(diagnosticId)
             if (downloadsWiping) {
-                abandonAcquiredDownload(key)
+                abandonDownload(key)
                 return
             }
             // Already downloaded? Skip re-downloading entirely rather than
@@ -502,13 +536,13 @@ class TrackDownloadManager @Inject constructor(
                 downloadedTrackDao.findByTrackKey(key)
                     ?: downloadedTrackDao.findByTitleAndArtist(title.trim(), artist.trim())
             } catch (cancelled: CancellationException) {
-                abandonAcquiredDownload(key)
+                abandonDownload(key)
                 return
             } catch (_: Exception) {
                 null
             }
             if (downloadsWiping) {
-                abandonAcquiredDownload(key)
+                abandonDownload(key)
                 return
             }
             if (existing != null) {
@@ -526,7 +560,7 @@ class TrackDownloadManager @Inject constructor(
                 if (fileStillPresent && DownloadRecordingPolicy.mayReuseFile(videoId, storedVideoId)) {
                     try {
                         if (includeVideo) {
-                            val videoError = downloadVideoExtra(key, existing, PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl, durationMs = durationMs), storedVideoId)
+                            val videoError = downloadVideoExtra(key, existing, PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl, durationMs = durationMs), storedVideoId, lease)
                             updateProgress(DownloadProgress(key, title, artist, 100,
                                 formatBadge = if (videoError == null) "AUDIO + VIDEO" else existing.formatBadge,
                                 isFinished = true, error = videoError))
@@ -534,12 +568,11 @@ class TrackDownloadManager @Inject constructor(
                                 if (videoError == null) showCompletedNotification(key.hashCode(), title, artist, "AUDIO + VIDEO")
                                 else showErrorNotification(key.hashCode(), key, title, artist, videoError)
                             }
-                        }
+                        } else updateProgress(DownloadProgress(key, title, artist, 100, formatBadge = existing.formatBadge, isFinished = true))
                     } catch (_: CancellationException) {
                         _downloads.update { it - key }
                     } finally {
-                        downloadSlots.release()
-                        forgetDownloadKey(key)
+                        forgetDownloadKey(key, keepResult = true)
                     }
                     return
                 }
@@ -550,7 +583,7 @@ class TrackDownloadManager @Inject constructor(
                 val dirName = try {
                     currentDownloadDirName()
                 } catch (cancelled: CancellationException) {
-                    abandonAcquiredDownload(key)
+                    abandonDownload(key)
                     return
                 }
                 val sanitizedBase = sanitizeFilename("${artist.trim()} - ${title.trim()}")
@@ -566,8 +599,8 @@ class TrackDownloadManager @Inject constructor(
                     }
                 }.getOrDefault(false)
                 if (found) {
-                    downloadSlots.release()
-                    forgetDownloadKey(key)
+                    updateProgress(DownloadProgress(key, title, artist, 100, isFinished = true))
+                    forgetDownloadKey(key, keepResult = true)
                     return
                 }
             }
@@ -599,97 +632,56 @@ class TrackDownloadManager @Inject constructor(
             var destinationFile: File? = null
             var audioPublished = false
             var tempDownloadFile: File? = null
+            var pendingVideo: TrackVideoRepository.PreparedDownload? = null
+            var videoTransfer: Deferred<String?>? = null
+            var artworkFallback: Deferred<String?>? = null
+            var preparedArtwork: Deferred<PreparedDownloadArtwork>? = null
+            var lyricsDeferred: Deferred<LyricsResult?>? = null
+            var moduleLicenseDeferred: Deferred<OfflineKeys?>? = null
+            val audioTransferComplete = AtomicBoolean(false)
+            val videoPercent = AtomicInteger(0)
+            fun reportVideoProgress(percent: Int) {
+                videoPercent.set(percent)
+                if (!audioTransferComplete.get()) return
+                updateProgress(DownloadProgress(key, title, artist, percent, formatBadge = "Saving video…"))
+                runCatching { showDownloadNotification(notifId, key, title, artist, percent, false, "Saving video…") }
+            }
+            fun startVideoTransfer(track: PlayableTrack, fallbackVideoId: String?) {
+                if (!includeVideo || videoTransfer != null) return
+                videoTransfer = async(Dispatchers.IO) {
+                    try {
+                        downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.VIDEO_RESOLVE)
+                        val prepared = try { prepareVideoExtra(track, fallbackVideoId) }
+                            finally { downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.VIDEO_RESOLVE) }
+                        prepared.diagnosticId = diagnosticId
+                        downloadDiagnostics.trace.video(diagnosticId, prepared.videoHeight ?: 0)
+                        pendingVideo = prepared
+                        prepared.transfer(::reportVideoProgress)
+                        null
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (failure: Exception) { videoFailureMessage(failure) }
+                    catch (oom: OutOfMemoryError) {
+                        android.util.Log.e("TrackDownloadManager", "Insufficient memory saving optional video", oom)
+                        "Audio saved; video failed: Not enough memory — retry one song at a time"
+                    }
+                }
+            }
 
             try {
                 ensureDownloadStillAllowed()
-                // Never let counter strings ("15 ml listens", "Track 16", "10K views")
-                // leak into filenames, tags or the DB. Callers on fixed code paths
-                // already pass clean values (AlbumDetailScreen safeArtist + hardened
-                // InnerTube parsing), this is the safety net for stale callers and
-                // for the already-queued stat-artist downloads.
-                val rawTitle = title.trim()
-                val rawArtistIsStat = ArtistHelper.isPlayCountOrStat(artist)
-                var safeArtist = artist.trim().takeUnless { ArtistHelper.isPlayCountOrStat(it) }?.ifBlank { null }
-                var safeAlbumInput = album?.trim()?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }?.takeIf { it.isNotBlank() }
-                // If the artist was a counter but the album title is known (album
-                // download case), recover the real artist via search before any
-                // network/stream work so tagging, filenames and DB stay correct.
-                if (safeArtist.isNullOrBlank() && rawTitle.isNotBlank()) {
-                    val recoveryQueryArtist = safeAlbumInput.orEmpty()
-                    val recovered = runCatching {
-                        if (recoveryQueryArtist.isNotBlank()) {
-                            innerTube.findBestMatch(rawTitle, recoveryQueryArtist, prefetchStreams = false)
-                        } else {
-                            innerTube.findBestMatch(rawTitle, "", prefetchStreams = false)
-                        }
-                    }.getOrNull()
-                    val recoveredArtist = recovered?.artist?.trim()
-                        ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                        ?.takeIf { it.isNotBlank() }
-                    if (recoveredArtist != null) {
-                        safeArtist = recoveredArtist
-                        if (safeAlbumInput.isNullOrBlank()) {
-                            safeAlbumInput = recovered.album?.trim()
-                                ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                                ?.takeIf { it.isNotBlank() }
-                        }
-                    }
-                }
-                val effTitle = rawTitle.ifBlank { title.trim() }
-                // Fall back to "Unknown Artist" only for display/filename; the DB
-                // repair pass below will re-resolve it when network allows.
-                val effArtist = safeArtist?.takeIf { it.isNotBlank() } ?: "Unknown Artist"
-                val effArtistForLookup = safeArtist?.takeIf { it.isNotBlank() } ?: ""
-                val artistWasStat = rawArtistIsStat || safeArtist.isNullOrBlank()
+                val metadata = prepareDownloadMetadata(title, artist, album, artworkUrl, videoId)
+                val finalTitle = metadata.title
+                val finalArtist = metadata.artist
+                val finalKey = metadata.key
+                val safeArtist = metadata.safeArtist
+                var resolvedArtworkUrl = metadata.artworkUrl
+                var resolvedAlbum = metadata.album
+                val preloadedBestMatch = metadata.match
 
-                // Resolve missing metadata & cover art proactively
-                var resolvedArtworkUrl = artworkUrl?.takeIf { ArtworkNormalizer.isRealImage(it) }
-                var resolvedAlbum = safeAlbumInput?.takeIf { it.isNotBlank() }
-                var preloadedBestMatch: YouTubeMusicTrack? = null
-
-                if (!videoId.isNullOrBlank()) {
-                    preloadedBestMatch = runCatching {
-                        innerTube.fetchSongDetails(videoId)
-                    }.getOrNull()
-                }
-
-                if (videoId.isNullOrBlank() && preloadedBestMatch == null && (resolvedArtworkUrl == null || resolvedAlbum == null)) {
-                    preloadedBestMatch = runCatching {
-                        innerTube.findBestMatch(effTitle, effArtistForLookup, prefetchStreams = false)
-                    }.getOrNull()
-                }
-
-                if (preloadedBestMatch != null) {
-                    val cleanMatchArtist = preloadedBestMatch.artist
-                        .takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                    if (artistWasStat && cleanMatchArtist != null && cleanMatchArtist.isNotBlank()) {
-                        safeArtist = cleanMatchArtist.trim()
-                    }
-                    if (resolvedArtworkUrl == null) {
-                        resolvedArtworkUrl = preloadedBestMatch.artworkUrl?.takeIf { ArtworkNormalizer.isRealImage(it) }
-                    }
-                    if (resolvedAlbum == null) {
-                        resolvedAlbum = preloadedBestMatch.album?.trim()
-                            ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                            ?.takeIf { it.isNotBlank() }
-                    }
-                }
-                if (resolvedAlbum != null) {
-                    resolvedAlbum = resolvedAlbum?.trim()
-                        ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                        ?.takeIf { it.isNotBlank() }
-                }
-                // Final sanitized values for tagging, filenames, folders and DB.
-                // safeArtist may have been recovered above; effArtist was snapshotted
-                // before, so recompute here.
-                val finalTitle = effTitle
-                val finalArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: effArtist
-                // DB key must never embed a counter string, otherwise one album
-                // fans out into N artists/albums ("15 ml listens", "Track 3"...).
-                val finalKey = makeDownloadKey(finalTitle, finalArtist)
-
-                val artworkFallback = if (resolvedArtworkUrl == null) {
+                artworkFallback = if (resolvedArtworkUrl == null) {
                     async(Dispatchers.IO) {
+                        kotlinx.coroutines.withTimeoutOrNull(4_000L) {
+                        try {
                         artworkRepository.resolve(finalTitle, finalArtist)
                         val cacheKey = ArtworkNormalizer.cacheKey(finalTitle, finalArtist)
                         artworkRepository.resolved.value[cacheKey]
@@ -697,13 +689,44 @@ class TrackDownloadManager @Inject constructor(
                             ?: kotlinx.coroutines.withTimeoutOrNull(3_500L) {
                                 artworkRepository.resolved.first { it.containsKey(cacheKey) }[cacheKey]
                             }?.takeIf { ArtworkNormalizer.isRealImage(it) }
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
+                        }
                     }
                 } else {
                     null
                 }
 
+                // Fetch and normalize the actual image while streams resolve and
+                // transfer. Tagging below is strictly local and never fetches it again.
+                val earlyArtwork = resolvedArtworkUrl ?: videoId?.takeIf(String::isNotBlank)
+                    ?.let { "https://i.ytimg.com/vi/$it/hqdefault.jpg" }
+                val secondaryArtwork = preloadedBestMatch?.artworkUrl
+                preparedArtwork = async(Dispatchers.IO) {
+                    downloadDiagnostics.phase(diagnosticId, DownloadTrace.Phase.ARTWORK_PREPARE) {
+                        try {
+                            val url = earlyArtwork ?: awaitOptionalDownloadResult(artworkFallback, 4_000L)
+                            PreparedDownloadArtwork(url, audioTagWriter.prepareArtworkBytes(url, secondaryArtwork))
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { PreparedDownloadArtwork(earlyArtwork, null) }
+                        catch (_: OutOfMemoryError) { PreparedDownloadArtwork(earlyArtwork, null) }
+                    }
+                }
+
+                downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.PREPARE_METADATA)
+                downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
                 // 1. Resolve source — respect user's download quality preference (Lossless tiers or YouTube Music)
                 val misc = runCatching { settingsPreferences.settings.first() }.getOrDefault(MiscSettings())
+                val shouldDownloadLyrics = misc.downloadLyrics
+                // Start enrichment before stream resolution and transfer, not after the bytes arrive.
+                lyricsDeferred = if (shouldDownloadLyrics) async(Dispatchers.IO) {
+                    kotlinx.coroutines.withTimeoutOrNull(8_000L) {
+                        try { lyricsRepository.getLyrics(finalTitle, finalArtist, resolvedAlbum,
+                            durationSeconds = durationMs?.let { (it / 1000L).toInt() }, videoId = videoId) }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { null }
+                    }
+                } else null
                 ensureDownloadStillAllowed()
                 // Custom SAF folder (e.g. SD card): resolve once per download.
                 // A stale grant (revoked permission / removed card) fails fast
@@ -745,7 +768,6 @@ class TrackDownloadManager @Inject constructor(
 
                 // 1. Provider module (.lwp engine): progressive clear FLAC/MP3 or segmented DASH (Dolby Atmos / Tidal Hi-Res)
                 var moduleDescriptor: SegmentedStreamDescriptor? = null
-                var moduleLicenseDeferred: Deferred<OfflineKeys?>? = null
                 var isDashModuleDownload = false
                 var dashInitUrl: String? = null
                 var dashMediaTemplate: String? = null
@@ -1009,13 +1031,17 @@ class TrackDownloadManager @Inject constructor(
                                 isLossless = !s.codec.equals("opus", ignoreCase = true)
                                 durationMs = desc.durationSec * 1000L
                                 // Offline license in parallel with the bytes.
-                                moduleLicenseDeferred = applicationScope.async(Dispatchers.IO) {
+                                moduleLicenseDeferred = async(Dispatchers.IO) {
                                     runCatching { offlineLicense.acquire(desc) }.getOrNull()
                                 }
                             }
                         }
 
                         if (resolvedUrl != null) {
+                            downloadDiagnostics.trace.source(diagnosticId, "PROVIDER", 0)
+                            downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
+                            acquireTransferSlot(lease, diagnosticId)
+                            startVideoTransfer(PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl), videoId)
                             val rawFile = File.createTempFile("dl_raw_", ".$extension", context.cacheDir)
                                 tempDownloadFile = rawFile
 
@@ -1210,84 +1236,14 @@ class TrackDownloadManager @Inject constructor(
 
                 // 2. Fallback to YouTube Music if module was not requested or module download failed
                 if (!downloadSucceeded) {
+                    downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
                     try {
                         updateStage("Finding YouTube stream…", notify = true)
-                        val lookupArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: ""
-                        // Try both extractors for the same selected video. Never replace a
-                        // failed concert/live upload with a different recording from search.
-                        // Budgeted: downloads run strictly serially, so one
-                        // wedged track must not stall the whole batch queue.
-                        val ytFallbackStartMs = android.os.SystemClock.elapsedRealtime()
-                        val ytResolveBudgetMs = 60_000L
-                        val candidateTracks = linkedMapOf<String, YouTubeMusicTrack>()
-                        videoId?.takeIf { it.isNotBlank() }?.let { candidateTracks[it] =
-                            preloadedBestMatch?.takeIf { match -> match.videoId == it }
-                                ?: YouTubeMusicTrack(videoId = it, title = finalTitle, artist = finalArtist)
-                        }
-                        preloadedBestMatch?.videoId?.takeIf { it.isNotBlank() && !isSelectedRecording }?.let { id ->
-                            candidateTracks.putIfAbsent(id, preloadedBestMatch!!)
-                        }
-                        // Broad search is capped inside (10 merged candidates);
-                        // the 60s resolve budget below bounds the slow path.
-                        if (!isSelectedRecording) {
-                            runCatching {
-                                innerTube.findDownloadCandidates(finalTitle, lookupArtist)
-                            }.getOrDefault(emptyList()).forEach { track ->
-                                candidateTracks.putIfAbsent(track.videoId, track)
-                            }
-                        }
-                        // Last resort: legacy single strict match (kept for metadata only).
-                        if (candidateTracks.isEmpty() && !isSelectedRecording) {
-                            runCatching {
-                                innerTube.findBestMatch(finalTitle, lookupArtist, prefetchStreams = false)
-                            }.getOrNull()?.let { track ->
-                                candidateTracks.putIfAbsent(track.videoId, track)
-                            }
-                        }
-                        if (candidateTracks.isEmpty()) throw IOException("No YouTube match found for $finalTitle by $finalArtist")
-                        var pickedStream: com.lastwave.app.data.music.YouTubeAudioStream? = null
-                        var actualVideoId: String? = null
-                        var chosenTrack: YouTubeMusicTrack? = null
-                        var lastResolveError: Throwable? = null
-                        for ((candidateId, candidateTrack) in candidateTracks) {
-                            if (!DownloadRecordingPolicy.mayTryCandidate(videoId, candidateId,
-                                finalTitle, resolvedAlbum, candidateTrack.title, candidateTrack.album, finalArtist)) continue
-                            if (android.os.SystemClock.elapsedRealtime() - ytFallbackStartMs > ytResolveBudgetMs) {
-                                android.util.Log.w(
-                                    "TrackDownloadManager",
-                                    "YouTube resolve budget exhausted for $finalTitle by $finalArtist; skipping remaining candidates",
-                                )
-                                break
-                            }
-                            // 1. Same waterfall playback uses (cache + multi-client direct URLs).
-                            pickedStream = runCatching {
-                                innerTube.peekCachedStream(candidateId)
-                                    ?: innerTube.resolveAudioStream(candidateId)
-                            }.getOrNull()
-                            if (pickedStream == null) {
-                                lastResolveError = null
-                            }
-                            // 2. NewPipe M4A fallback (download-container preference only).
-                            if (pickedStream == null) {
-                                pickedStream = runCatching {
-                                    innerTube.resolveDownloadStream(candidateId)
-                                }.getOrElse { error ->
-                                    if (error !is CancellationException) lastResolveError = error
-                                    null
-                                }
-                            }
-                            if (pickedStream != null) {
-                                actualVideoId = candidateId
-                                resolvedYtVideoId = candidateId
-                                chosenTrack = candidateTrack
-                                break
-                            }
-                        }
-                        val resolvedStream = pickedStream ?: if (isSelectedRecording) {
-                            throw IOException("Could not download the selected recording. No other version was substituted. Try again while online.", lastResolveError)
-                        } else {
-                            throw (lastResolveError ?: IOException("No playable YouTube stream for $finalTitle by $finalArtist"))
-                        }
+                        val selected = resolveYouTubeDownloadCandidate(videoId, finalTitle, finalArtist,
+                            resolvedAlbum, safeArtist?.trim().orEmpty(), preloadedBestMatch, isSelectedRecording)
+                        val chosenTrack = selected.track
+                        val ytStream = selected.stream
+                        resolvedYtVideoId = selected.videoId
                         if (resolvedArtworkUrl == null) {
                             resolvedArtworkUrl = (chosenTrack?.artworkUrl ?: preloadedBestMatch?.artworkUrl)
                                 ?.takeIf { ArtworkNormalizer.isRealImage(it) }
@@ -1295,7 +1251,8 @@ class TrackDownloadManager @Inject constructor(
                         if (resolvedAlbum == null) resolvedAlbum = (chosenTrack?.album ?: preloadedBestMatch?.album)?.trim()
                             ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
                             ?.takeIf { it.isNotBlank() }
-                        val ytStream = resolvedStream
+                        downloadDiagnostics.trace.source(diagnosticId, ytStream.clientProfile, ytStream.bitrate)
+                        downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
                         resolvedUrl = ytStream.url
                         downloadHeaders = ytStream.requestHeaders
                         expectedContentLength = ytStream.contentLength
@@ -1325,6 +1282,8 @@ class TrackDownloadManager @Inject constructor(
                         }
                         isLossless = false
 
+                        acquireTransferSlot(lease, diagnosticId)
+                        startVideoTransfer(PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl), resolvedYtVideoId)
                         val rawFile = File.createTempFile("dl_raw_", ".$extension", context.cacheDir)
                         tempDownloadFile = rawFile
 
@@ -1448,6 +1407,10 @@ class TrackDownloadManager @Inject constructor(
                     } catch (cancellation: CancellationException) {
                         throw cancellation
                     } catch (ytError: Throwable) {
+                        // The next explicit retry must not reuse this failed
+                        // recording's cached audio/video URLs. Do not wipe player
+                        // JavaScript caches for ordinary transfer/network failures.
+                        resolvedYtVideoId?.let { innerTube.invalidateCache(it) }
                         // Surface the real reason (no match vs no stream vs
                         // network) so a playable song never shows a generic skip.
                         val reason = ytError.localizedMessage?.takeIf { it.isNotBlank() }
@@ -1472,28 +1435,19 @@ class TrackDownloadManager @Inject constructor(
                     }
                 }
 
-                // 3. Proactively start lyrics lookup concurrently with the download
-                val shouldDownloadLyrics = runCatching {
-                    settingsPreferences.settings.first().downloadLyrics
-                }.getOrDefault(true)
-
-                val lyricsDeferred = if (shouldDownloadLyrics) {
-                    async(Dispatchers.IO) {
-                        runCatching {
-                            lyricsRepository.getLyrics(
-                                title = finalTitle,
-                                artist = finalArtist,
-                                album = resolvedAlbum,
-                                durationSeconds = null,
-                            )
-                        }.getOrNull()
-                    }
-                } else {
-                    null
-                }
-
+                    audioTransferComplete.set(true)
+                    if (videoTransfer?.isCompleted == false) reportVideoProgress(videoPercent.get())
+                    var videoError = videoTransfer?.await()
+                    downloadDiagnostics.trace.logicalMedia(diagnosticId, bytesReadTotal,
+                        pendingVideo?.videoFileBytes ?: 0L, pendingVideo?.soundtrackFileBytes ?: 0L)
+                    // All media bytes are now local. The next prepared song may start
+                    // while these files are remuxed, tagged, enriched, and published.
+                    acquireFinishingSlot(lease, diagnosticId)
+                    ensureDownloadStillAllowed()
+                    updateStage("Finishing files…")
                     val downloadedFile = tempDownloadFile ?: throw IOException("Downloaded file is missing")
                     var currentAudioFile = downloadedFile
+                    downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.REMUX)
 
                     // Losslessly remux WebM Opus into standard Ogg Opus for universal player & tag compatibility
                     if (extension == "webm") {
@@ -1591,11 +1545,13 @@ class TrackDownloadManager @Inject constructor(
                         }
                     }
 
+                    downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.REMUX)
                     val filenameStem = sanitizeFilename("$finalArtist - $finalTitle") +
                         DownloadRecordingPolicy.filenameSuffix(key, videoId)
                     val safeFilename = "$filenameStem.$extension"
 
                     // 4. Resolve exact audio duration from downloaded file
+                    downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.FILE_METADATA)
                     val durationRetriever = android.media.MediaMetadataRetriever()
                     try {
                         durationRetriever.setDataSource(currentAudioFile.absolutePath)
@@ -1608,25 +1564,18 @@ class TrackDownloadManager @Inject constructor(
                     } catch (_: Exception) {
                     } finally {
                         runCatching { durationRetriever.release() }
+                        downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.FILE_METADATA)
                     }
 
-                    // 5. Complete lyrics resolution (using concurrent result or duration-assisted fallback)
+                    // Optional enrichment gets a bounded finishing budget; never start another provider waterfall here.
                     var hasLyrics = false
                     var syncedLyrics: String? = null
                     var plainLyrics: String? = null
                     var lrcPath: String? = null
 
                     if (shouldDownloadLyrics) {
-                        var lyricsRecord = lyricsDeferred?.await()
-                        if (lyricsRecord !is LyricsResult.Success && durationMs > 0) {
-                            lyricsRecord = runCatching {
-                                lyricsRepository.getLyrics(
-                                    title = finalTitle,
-                                    artist = finalArtist,
-                                    album = resolvedAlbum,
-                                    durationSeconds = (durationMs / 1000).toInt(),
-                                )
-                            }.getOrNull()
+                        val lyricsRecord = downloadDiagnostics.phase(diagnosticId, DownloadTrace.Phase.LYRICS_WAIT) {
+                            awaitOptionalDownloadResult(lyricsDeferred, 1_500L)
                         }
 
                         if (lyricsRecord is LyricsResult.Success) {
@@ -1643,13 +1592,11 @@ class TrackDownloadManager @Inject constructor(
                         }
                     }
 
-                    if (resolvedArtworkUrl == null) {
-                        // await() outside runCatching used to fail the whole
-                        // download when the artwork fetch itself threw.
-                        resolvedArtworkUrl = runCatching { artworkFallback?.await() }.getOrNull()
-                    } else {
-                        artworkFallback?.cancel()
+                    val cover = downloadDiagnostics.phase(diagnosticId, DownloadTrace.Phase.ARTWORK_WAIT) {
+                        awaitOptionalDownloadResult(preparedArtwork, 500L)
                     }
+                    resolvedArtworkUrl = cover?.sourceUrl ?: resolvedArtworkUrl
+                    artworkFallback?.cancel()
                     if (resolvedArtworkUrl == null) {
                         // Last resort (SimpMusic/Metrolist style): the YouTube
                         // thumbnail for the exact downloaded video always exists.
@@ -1662,21 +1609,23 @@ class TrackDownloadManager @Inject constructor(
                     // downloaded audio file (container-aware: Vorbis comments +
                     // PICTURE for FLAC/Opus, Matroska tags for WebM,
                     // iTunes atoms for M4A, ID3v2.3 otherwise).
-                    val metadataEmbedded = audioTagWriter.embedMetadata(
-                        audioFile = currentAudioFile,
-                        title = finalTitle,
-                        artist = finalArtist,
-                        album = resolvedAlbum,
-                        artworkUrl = resolvedArtworkUrl,
-                        artworkFallbackUrl = preloadedBestMatch?.artworkUrl,
-                        lyrics = if (shouldDownloadLyrics) (syncedLyrics ?: plainLyrics) else null,
-                        year = year,
-                    )
+                    val metadataEmbedded = downloadDiagnostics.phase(diagnosticId, DownloadTrace.Phase.TAG_WRITE) {
+                        audioTagWriter.embedPreparedMetadata(
+                            audioFile = currentAudioFile,
+                            title = finalTitle,
+                            artist = finalArtist,
+                            album = resolvedAlbum,
+                            artworkBytes = cover?.bytes,
+                            lyrics = if (shouldDownloadLyrics) (syncedLyrics ?: plainLyrics) else null,
+                            year = year,
+                        )
+                    }
                     if (!metadataEmbedded) {
                         android.util.Log.w("TrackDownloadManager", "Could not safely embed audio metadata; preserving audio file")
                     }
 
                     // 5. Transfer tagged file to public storage / MediaStore
+                    downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.PUBLIC_COPY)
                     val dirName = sanitizeDownloadFolderName(misc.downloadFolder)
                     val subpath = downloadSubpath(
                         artist = finalArtist,
@@ -1749,6 +1698,8 @@ class TrackDownloadManager @Inject constructor(
                     }
                 }
 
+                downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.PUBLIC_COPY)
+                downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.DB_PUBLISH)
                 // 6. Persist to Room database (finalKey never embeds counters,
                 // so one album can no longer fan out into N artists/albums).
                 val entity = DownloadedTrackEntity(
@@ -1812,7 +1763,14 @@ class TrackDownloadManager @Inject constructor(
                 // A video cancellation/failure must not delete a completed audio download.
                 activeUris.remove(key)
                 activeFiles.remove(key)
-                val videoError = if (includeVideo) downloadVideoExtra(key, entity, PlayableTrack(title, artist, album, videoId = videoId, playbackUrl = playbackUrl, durationMs = durationMs), resolvedYtVideoId) else null
+                if (includeVideo && videoError == null) {
+                    try {
+                        ensureDownloadStillAllowed()
+                        checkNotNull(pendingVideo).publish(listOfNotNull(entity.filePath, entity.mediaStoreUri))
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (failure: Exception) { videoError = videoFailureMessage(failure) }
+                }
+                downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.DB_PUBLISH)
                 val finishedBadge = if (includeVideo && videoError == null) "$formatBadge + VIDEO" else formatBadge
                 updateProgress(
                     DownloadProgress(
@@ -1832,7 +1790,7 @@ class TrackDownloadManager @Inject constructor(
                 // the file is fine, but the user sees what didn't attach.
                 val missingExtras = buildList {
                     if (shouldDownloadLyrics && !hasLyrics) add("no lyrics")
-                    if (resolvedArtworkUrl == null) add("no art")
+                    if (cover?.bytes == null) add("no art")
                     if (!metadataEmbedded) add("untagged")
                 }
                 if (missingExtras.isNotEmpty()) {
@@ -1888,7 +1846,12 @@ class TrackDownloadManager @Inject constructor(
                     showErrorNotification(notifId, key, title, artist, error.localizedMessage ?: "Failed")
                 }
             } finally {
-                runCatching { downloadSlots.release() }
+                // Native HTTP callbacks must settle before staged files are removed.
+                withContext(NonCancellable) { videoTransfer?.cancelAndJoin(); preparedArtwork?.cancelAndJoin() }
+                runCatching { pendingVideo?.close() }
+                artworkFallback?.cancel()
+                lyricsDeferred?.cancel()
+                moduleLicenseDeferred?.cancel()
                 activeKeys.remove(key)
                 activeJobs.remove(key)
                 activeUris.remove(key)
@@ -1898,31 +1861,240 @@ class TrackDownloadManager @Inject constructor(
             }
     }
 
+    private data class PreparedMetadata(
+        val title: String, val artist: String, val key: String, val safeArtist: String?,
+        val artworkUrl: String?, val album: String?, val match: YouTubeMusicTrack?,
+    )
+
+    // Keep metadata preparation and candidate selection out of the already large
+    // coroutine state machine (JVM methods have a hard 64 KiB bytecode limit).
+    private suspend fun prepareDownloadMetadata(
+        title: String, artist: String, album: String?, artworkUrl: String?, videoId: String?,
+    ): PreparedMetadata {
+        // Never let counter strings ("15 ml listens", "Track 16", "10K views")
+        // leak into filenames, tags or the DB. Callers on fixed code paths
+        // already pass clean values (AlbumDetailScreen safeArtist + hardened
+        // InnerTube parsing), this is the safety net for stale callers and
+        // for the already-queued stat-artist downloads.
+        val rawTitle = title.trim()
+        val rawArtistIsStat = ArtistHelper.isPlayCountOrStat(artist)
+        var safeArtist = artist.trim().takeUnless { ArtistHelper.isPlayCountOrStat(it) }?.ifBlank { null }
+        var safeAlbumInput = album?.trim()?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }?.takeIf { it.isNotBlank() }
+        // If the artist was a counter but the album title is known (album
+        // download case), recover the real artist via search before any
+        // network/stream work so tagging, filenames and DB stay correct.
+        if (safeArtist.isNullOrBlank() && rawTitle.isNotBlank()) {
+            val recoveryQueryArtist = safeAlbumInput.orEmpty()
+            val recovered = runCatching {
+                if (recoveryQueryArtist.isNotBlank()) {
+                    innerTube.findBestMatch(rawTitle, recoveryQueryArtist, prefetchStreams = false)
+                } else {
+                    innerTube.findBestMatch(rawTitle, "", prefetchStreams = false)
+                }
+            }.getOrNull()
+            val recoveredArtist = recovered?.artist?.trim()
+                ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+                ?.takeIf { it.isNotBlank() }
+            if (recoveredArtist != null) {
+                safeArtist = recoveredArtist
+                if (safeAlbumInput.isNullOrBlank()) {
+                    safeAlbumInput = recovered.album?.trim()
+                        ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+                        ?.takeIf { it.isNotBlank() }
+                }
+            }
+        }
+        val effTitle = rawTitle.ifBlank { title.trim() }
+        // Fall back to "Unknown Artist" only for display/filename; the DB
+        // repair pass below will re-resolve it when network allows.
+        val effArtist = safeArtist?.takeIf { it.isNotBlank() } ?: "Unknown Artist"
+        val effArtistForLookup = safeArtist?.takeIf { it.isNotBlank() } ?: ""
+        val artistWasStat = rawArtistIsStat || safeArtist.isNullOrBlank()
+
+        // Resolve missing metadata & cover art proactively
+        var resolvedArtworkUrl = artworkUrl?.takeIf { ArtworkNormalizer.isRealImage(it) }
+        var resolvedAlbum = safeAlbumInput?.takeIf { it.isNotBlank() }
+        var preloadedBestMatch: YouTubeMusicTrack? = null
+
+        // A known recording with valid metadata can resolve its stream immediately.
+        // Album/cover enrichment must not add a redundant blocking player request.
+        if (!videoId.isNullOrBlank() && artistWasStat) {
+            preloadedBestMatch = runCatching {
+                innerTube.fetchSongDetails(videoId)
+            }.getOrNull()
+        }
+
+        if (videoId.isNullOrBlank() && preloadedBestMatch == null && (resolvedArtworkUrl == null || resolvedAlbum == null)) {
+            preloadedBestMatch = runCatching {
+                innerTube.findBestMatch(effTitle, effArtistForLookup, prefetchStreams = false)
+            }.getOrNull()
+        }
+
+        if (preloadedBestMatch != null) {
+            val cleanMatchArtist = preloadedBestMatch.artist
+                .takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+            if (artistWasStat && cleanMatchArtist != null && cleanMatchArtist.isNotBlank()) {
+                safeArtist = cleanMatchArtist.trim()
+            }
+            if (resolvedArtworkUrl == null) {
+                resolvedArtworkUrl = preloadedBestMatch.artworkUrl?.takeIf { ArtworkNormalizer.isRealImage(it) }
+            }
+            if (resolvedAlbum == null) {
+                resolvedAlbum = preloadedBestMatch.album?.trim()
+                    ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+                    ?.takeIf { it.isNotBlank() }
+            }
+        }
+        if (resolvedAlbum != null) {
+            resolvedAlbum = resolvedAlbum?.trim()
+                ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+                ?.takeIf { it.isNotBlank() }
+        }
+        // Final sanitized values for tagging, filenames, folders and DB.
+        // safeArtist may have been recovered above; effArtist was snapshotted
+        // before, so recompute here.
+        val finalTitle = effTitle
+        val finalArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: effArtist
+        // DB key must never embed a counter string, otherwise one album
+        // fans out into N artists/albums ("15 ml listens", "Track 3"...).
+        val finalKey = makeDownloadKey(finalTitle, finalArtist)
+        return PreparedMetadata(finalTitle, finalArtist, finalKey, safeArtist, resolvedArtworkUrl, resolvedAlbum, preloadedBestMatch)
+    }
+
+    private data class ResolvedDownloadCandidate(
+        val stream: com.lastwave.app.data.music.YouTubeAudioStream,
+        val videoId: String, val track: YouTubeMusicTrack?,
+    )
+
+    private suspend fun resolveYouTubeDownloadCandidate(
+        videoId: String?, finalTitle: String, finalArtist: String, resolvedAlbum: String?,
+        lookupArtist: String, preloadedBestMatch: YouTubeMusicTrack?, isSelectedRecording: Boolean,
+    ): ResolvedDownloadCandidate {
+        // Try both extractors for the same selected video. Never replace a
+        // failed concert/live upload with a different recording from search.
+        // Budgeted: a wedged recording must not monopolize a download slot.
+        val ytFallbackStartMs = android.os.SystemClock.elapsedRealtime()
+        val ytResolveBudgetMs = 60_000L
+        val candidateTracks = linkedMapOf<String, YouTubeMusicTrack>()
+        videoId?.takeIf { it.isNotBlank() }?.let { candidateTracks[it] =
+            preloadedBestMatch?.takeIf { match -> match.videoId == it }
+                ?: YouTubeMusicTrack(videoId = it, title = finalTitle, artist = finalArtist)
+        }
+        preloadedBestMatch?.videoId?.takeIf { it.isNotBlank() && !isSelectedRecording }?.let { id ->
+            candidateTracks.putIfAbsent(id, preloadedBestMatch!!)
+        }
+        // Broad search is capped inside (10 merged candidates);
+        // the 60s resolve budget below bounds the slow path.
+        if (!isSelectedRecording) {
+            runCatching {
+                innerTube.findDownloadCandidates(finalTitle, lookupArtist)
+            }.getOrDefault(emptyList()).forEach { track ->
+                candidateTracks.putIfAbsent(track.videoId, track)
+            }
+        }
+        // Last resort: legacy single strict match (kept for metadata only).
+        if (candidateTracks.isEmpty() && !isSelectedRecording) {
+            runCatching {
+                innerTube.findBestMatch(finalTitle, lookupArtist, prefetchStreams = false)
+            }.getOrNull()?.let { track ->
+                candidateTracks.putIfAbsent(track.videoId, track)
+            }
+        }
+        if (candidateTracks.isEmpty()) throw IOException("No YouTube match found for $finalTitle by $finalArtist")
+        var pickedStream: com.lastwave.app.data.music.YouTubeAudioStream? = null
+        var actualVideoId: String? = null
+        var chosenTrack: YouTubeMusicTrack? = null
+        var lastResolveError: Throwable? = null
+        for ((candidateId, candidateTrack) in candidateTracks) {
+            if (!DownloadRecordingPolicy.mayTryCandidate(videoId, candidateId,
+                finalTitle, resolvedAlbum, candidateTrack.title, candidateTrack.album, finalArtist)) continue
+            if (android.os.SystemClock.elapsedRealtime() - ytFallbackStartMs > ytResolveBudgetMs) {
+                android.util.Log.w(
+                    "TrackDownloadManager",
+                    "YouTube resolve budget exhausted for $finalTitle by $finalArtist; skipping remaining candidates",
+                )
+                break
+            }
+            // Fresh cache, then immediate exact-recording extraction.
+            // The multi-client playback waterfall is now the fallback,
+            // not a 4s prerequisite before the extractor that succeeds.
+            pickedStream = runCatching {
+                innerTube.resolveDownloadStream(candidateId)
+            }.getOrElse { error ->
+                if (error is CancellationException) throw error
+                lastResolveError = error
+                null
+            }
+            if (pickedStream != null) {
+                actualVideoId = candidateId
+                chosenTrack = candidateTrack
+                break
+            }
+        }
+        val resolvedStream = pickedStream ?: if (isSelectedRecording) {
+            throw IOException("Could not download the selected recording. No other version was substituted. Try again while online.", lastResolveError)
+        } else {
+            throw (lastResolveError ?: IOException("No playable YouTube stream for $finalTitle by $finalArtist"))
+        }
+        return ResolvedDownloadCandidate(resolvedStream, checkNotNull(actualVideoId), chosenTrack)
+    }
+
+    private suspend fun acquireTransferSlot(lease: DownloadPipeline.Lease, diagnosticId: Long?) {
+        diagnosticId?.let { downloadDiagnostics.trace.startPhase(it, DownloadTrace.Phase.TRANSFER_SLOT_WAIT) }
+        try { lease.beginTransfer() }
+        finally { diagnosticId?.let { downloadDiagnostics.trace.endPhase(it, DownloadTrace.Phase.TRANSFER_SLOT_WAIT) } }
+    }
+
+    private suspend fun acquireFinishingSlot(lease: DownloadPipeline.Lease, diagnosticId: Long?) {
+        diagnosticId?.let { downloadDiagnostics.trace.startPhase(it, DownloadTrace.Phase.FINISH_SLOT_WAIT) }
+        try { lease.beginFinishing() }
+        finally { diagnosticId?.let { downloadDiagnostics.trace.endPhase(it, DownloadTrace.Phase.FINISH_SLOT_WAIT) } }
+        diagnosticId?.let { downloadDiagnostics.trace.startPhase(it, DownloadTrace.Phase.FINISHING) }
+    }
+
+    fun downloadTimingReport(): String = downloadDiagnostics.report()
+
     fun isVideoDownloaded(title: String, artist: String, album: String?, videoId: String?): Boolean =
         videoRepository.hasOfflineVideo(PlayableTrack(title, artist, album, videoId = videoId))
 
+    private fun videoFailureMessage(failure: Exception): String =
+        "Audio saved; video failed: ${failure.message ?: "try again while online"}"
+
+    private suspend fun prepareVideoExtra(track: PlayableTrack, resolvedVideoId: String?): TrackVideoRepository.PreparedDownload {
+        var fallback = resolvedVideoId
+        if (fallback == null && videoRepository.customSourceFor(track) == null && !videoRepository.hasOfflineVideo(track)) {
+            val match = innerTube.findBestMatchOrNull(track.title, track.artist, prefetchStreams = false)
+            if (match != null && DownloadRecordingPolicy.mayTryCandidate(track.videoId, match.videoId,
+                track.title, track.album, match.title, match.album, track.artist)) fallback = match.videoId
+        }
+        return videoRepository.prepareDownload(track, fallback)
+    }
+
     private suspend fun downloadVideoExtra(key: String, audio: DownloadedTrackEntity,
-        track: PlayableTrack, resolvedVideoId: String?): String? {
-        val requestedVideoId = track.videoId
+        track: PlayableTrack, resolvedVideoId: String?, lease: DownloadPipeline.Lease): String? {
+        var pending: TrackVideoRepository.PreparedDownload? = null
         return try {
-            var fallback = resolvedVideoId
-            if (fallback == null && videoRepository.customSourceFor(track) == null && !videoRepository.hasOfflineVideo(track)) {
-                val match = innerTube.findBestMatchOrNull(track.title, track.artist, prefetchStreams = false)
-                if (match != null && DownloadRecordingPolicy.mayTryCandidate(requestedVideoId, match.videoId,
-                    track.title, track.album, match.title, match.album, track.artist)) fallback = match.videoId
-            }
-            videoRepository.downloadVideo(track, listOfNotNull(audio.filePath, audio.mediaStoreUri), fallback) { percent ->
+            val diagnosticId = downloadDiagnostics.tag(key, DownloadTrace.Role.VIDEO)?.job
+            diagnosticId?.let { downloadDiagnostics.trace.endPhase(it, DownloadTrace.Phase.PREPARE_METADATA) }
+            diagnosticId?.let { downloadDiagnostics.trace.startPhase(it, DownloadTrace.Phase.VIDEO_RESOLVE) }
+            pending = try { prepareVideoExtra(track, resolvedVideoId) }
+                finally { diagnosticId?.let { downloadDiagnostics.trace.endPhase(it, DownloadTrace.Phase.VIDEO_RESOLVE) } }
+            pending.diagnosticId = diagnosticId
+            diagnosticId?.let { downloadDiagnostics.trace.video(it, pending.videoHeight ?: 0) }
+            acquireTransferSlot(lease, diagnosticId)
+            pending.transfer { percent ->
                 updateProgress(DownloadProgress(key, audio.title, audio.artist, percent,
                     formatBadge = "Saving video • audio ready"))
                 runCatching { showDownloadNotification(key.hashCode(), key, audio.title, audio.artist,
                     percent, false, "Saving video • audio ready") }
             }
+            acquireFinishingSlot(lease, diagnosticId)
+            ensureDownloadStillAllowed()
+            pending.publish(listOfNotNull(audio.filePath, audio.mediaStoreUri))
             null
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Exception) {
-            "Audio saved; video failed: ${failure.message ?: "try again while online"}"
-        }
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: Exception) { videoFailureMessage(failure) }
+        finally { pending?.close() }
     }
 
     private suspend fun downloadToTempFile(
@@ -2003,6 +2175,7 @@ class TrackDownloadManager @Inject constructor(
                 var downloadedBytesInRange = 0L
                 retryInterruptedTransfer(downloadKey, rangeConnectionStateChanged) {
                     downloadRange(
+                        downloadKey = downloadKey,
                         url = url,
                         target = target,
                         requestHeaders = requestHeaders,
@@ -2029,70 +2202,57 @@ class TrackDownloadManager @Inject constructor(
     }
 
     private suspend fun downloadRange(
+        downloadKey: String,
         url: String,
         target: File,
         requestHeaders: Map<String, String>,
         range: DownloadRange,
         expectedTotal: Long,
         onBytesRead: (Int) -> Unit,
-    ): String = suspendCancellableCoroutine { continuation ->
-        val request = buildDownloadRequest(url, requestHeaders, range)
+    ): String {
+        val request = buildDownloadRequest(url, requestHeaders, range, downloadKey = downloadKey)
         val call = downloadClient.newCall(request)
-        continuation.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(error)
+        return awaitDownloadResponse(call) { currentResponse, isActive ->
+            validateMediaResponse(currentResponse, expectedCode = 206)
+            val parsedRange = parseContentRange(currentResponse.header("Content-Range"))
+                ?: throw DownloadProtocolException("Missing Content-Range for parallel download")
+            if (parsedRange.start != range.start ||
+                parsedRange.endInclusive != range.endInclusive ||
+                parsedRange.total != expectedTotal
+            ) {
+                throw DownloadProtocolException("Mismatched Content-Range ${currentResponse.header("Content-Range")}")
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                try {
-                    val contentType = response.use { currentResponse ->
-                        validateMediaResponse(currentResponse, expectedCode = 206)
-                        val parsedRange = parseContentRange(currentResponse.header("Content-Range"))
-                            ?: throw DownloadProtocolException("Missing Content-Range for parallel download")
-                        if (parsedRange.start != range.start ||
-                            parsedRange.endInclusive != range.endInclusive ||
-                            parsedRange.total != expectedTotal
-                        ) {
-                            throw DownloadProtocolException("Mismatched Content-Range ${currentResponse.header("Content-Range")}")
-                        }
+            val body = currentResponse.body
+                ?: throw DownloadProtocolException("Empty range response body")
+            val bodyLength = body.contentLength()
+            if (bodyLength > 0L && bodyLength != range.length) {
+                throw DownloadProtocolException("Range length mismatch: received $bodyLength of ${range.length} bytes")
+            }
 
-                        val body = currentResponse.body
-                            ?: throw DownloadProtocolException("Empty range response body")
-                        val bodyLength = body.contentLength()
-                        if (bodyLength > 0L && bodyLength != range.length) {
-                            throw DownloadProtocolException("Range length mismatch: received $bodyLength of ${range.length} bytes")
+            RandomAccessFile(target, "rw").use { output ->
+                output.seek(range.start)
+                body.byteStream().use { input ->
+                    val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                    var remaining = range.length
+                    while (remaining > 0L) {
+                        if (!isActive()) throw CancellationException("Download cancelled")
+                        val read = try {
+                            input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                        } catch (error: IOException) {
+                            throw DownloadInterruptedException("Connection interrupted while reading audio", error)
                         }
-
-                        RandomAccessFile(target, "rw").use { output ->
-                            output.seek(range.start)
-                            body.byteStream().use { input ->
-                                val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
-                                var remaining = range.length
-                                while (remaining > 0L) {
-                                    if (!continuation.isActive) throw CancellationException("Download cancelled")
-                                    val read = try {
-                                        input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
-                                    } catch (error: IOException) {
-                                        throw DownloadInterruptedException("Connection interrupted while reading audio", error)
-                                    }
-                                    if (read < 0) {
-                                        throw DownloadInterruptedException("Range truncated with $remaining bytes remaining")
-                                    }
-                                    output.write(buffer, 0, read)
-                                    remaining -= read
-                                    onBytesRead(read)
-                                }
-                            }
+                        if (read < 0) {
+                            throw DownloadInterruptedException("Range truncated with $remaining bytes remaining")
                         }
-                        currentResponse.header("Content-Type").orEmpty()
+                        output.write(buffer, 0, read)
+                        remaining -= read
+                        onBytesRead(read)
                     }
-                    if (continuation.isActive) continuation.resume(contentType)
-                } catch (error: Exception) {
-                    if (continuation.isActive) continuation.resumeWithException(error)
                 }
             }
-        })
+            currentResponse.header("Content-Type").orEmpty()
+        }
     }
 
     private suspend fun downloadSingleStream(
@@ -2112,6 +2272,7 @@ class TrackDownloadManager @Inject constructor(
                 return@retryInterruptedTransfer DownloadTransfer(expectedLength, expectedLength, "")
             }
             downloadSingleStreamAttempt(
+                downloadKey = downloadKey,
                 url = url,
                 target = target,
                 requestHeaders = requestHeaders,
@@ -2122,107 +2283,94 @@ class TrackDownloadManager @Inject constructor(
     }
 
     private suspend fun downloadSingleStreamAttempt(
+        downloadKey: String,
         url: String,
         target: File,
         requestHeaders: Map<String, String>,
         expectedContentLength: Long?,
         onProgress: (downloadedBytes: Long, totalBytes: Long) -> Unit,
-    ): DownloadTransfer = suspendCancellableCoroutine { continuation ->
+    ): DownloadTransfer {
         val resumeOffset = target.length().coerceAtLeast(0L)
         val call = downloadClient.newCall(
-            buildDownloadRequest(url, requestHeaders, range = null, resumeOffset = resumeOffset),
+            buildDownloadRequest(url, requestHeaders, range = null, resumeOffset = resumeOffset, downloadKey = downloadKey),
         )
-        continuation.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(error)
+        return awaitDownloadResponse(call) { currentResponse, isActive ->
+            validateMediaResponse(currentResponse)
+            val body = currentResponse.body
+                ?: throw DownloadProtocolException("Empty response body")
+            val responseLength = body.contentLength().takeIf { it > 0L }
+            val partialRange = if (currentResponse.code == 206) {
+                parseContentRange(currentResponse.header("Content-Range"))
+                    ?: throw DownloadProtocolException("Missing Content-Range for partial response")
+            } else {
+                null
+            }
+            if (partialRange != null && (partialRange.start != resumeOffset ||
+                    partialRange.endInclusive + 1L != partialRange.total)
+            ) {
+                throw DownloadProtocolException("Server returned an unexpected audio range")
+            }
+            if (partialRange != null && expectedContentLength != null &&
+                partialRange.total != expectedContentLength
+            ) {
+                throw DownloadProtocolException(
+                    "Download size changed: expected $expectedContentLength, received ${partialRange.total}",
+                )
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                try {
-                    val transfer = response.use { currentResponse ->
-                        validateMediaResponse(currentResponse)
-                        val body = currentResponse.body
-                            ?: throw DownloadProtocolException("Empty response body")
-                        val responseLength = body.contentLength().takeIf { it > 0L }
-                        val partialRange = if (currentResponse.code == 206) {
-                            parseContentRange(currentResponse.header("Content-Range"))
-                                ?: throw DownloadProtocolException("Missing Content-Range for partial response")
-                        } else {
-                            null
-                        }
-                        if (partialRange != null && (partialRange.start != resumeOffset ||
-                                partialRange.endInclusive + 1L != partialRange.total)
-                        ) {
-                            throw DownloadProtocolException("Server returned an unexpected audio range")
-                        }
-                        if (partialRange != null && expectedContentLength != null &&
-                            partialRange.total != expectedContentLength
-                        ) {
-                            throw DownloadProtocolException(
-                                "Download size changed: expected $expectedContentLength, received ${partialRange.total}",
-                            )
-                        }
+            val totalLength = partialRange?.total
+                ?: responseLength
+                ?: expectedContentLength?.takeIf { it > 0L }
+                ?: -1L
+            if (responseLength != null && expectedContentLength != null &&
+                currentResponse.code == 200 && responseLength != expectedContentLength
+            ) {
+                throw DownloadProtocolException(
+                    "Download size changed: expected $expectedContentLength, received $responseLength",
+                )
+            }
 
-                        val totalLength = partialRange?.total
-                            ?: responseLength
-                            ?: expectedContentLength?.takeIf { it > 0L }
-                            ?: -1L
-                        if (responseLength != null && expectedContentLength != null &&
-                            currentResponse.code == 200 && responseLength != expectedContentLength
-                        ) {
-                            throw DownloadProtocolException(
-                                "Download size changed: expected $expectedContentLength, received $responseLength",
-                            )
+            val append = resumeOffset > 0L && partialRange != null
+            var downloadedBytes = if (append) resumeOffset else 0L
+            FileOutputStream(target, append).use { output ->
+                body.byteStream().use { input ->
+                    val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
+                    while (true) {
+                        if (!isActive()) throw CancellationException("Download cancelled")
+                        val read = try {
+                            input.read(buffer)
+                        } catch (error: IOException) {
+                            throw DownloadInterruptedException("Connection interrupted while reading audio", error)
                         }
-
-                        val append = resumeOffset > 0L && partialRange != null
-                        var downloadedBytes = if (append) resumeOffset else 0L
-                        FileOutputStream(target, append).use { output ->
-                            body.byteStream().use { input ->
-                                val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
-                                while (true) {
-                                    if (!continuation.isActive) throw CancellationException("Download cancelled")
-                                    val read = try {
-                                        input.read(buffer)
-                                    } catch (error: IOException) {
-                                        throw DownloadInterruptedException("Connection interrupted while reading audio", error)
-                                    }
-                                    if (read < 0) break
-                                    output.write(buffer, 0, read)
-                                    downloadedBytes += read
-                                    onProgress(downloadedBytes, totalLength)
-                                }
-                            }
-                            output.flush()
-                            output.fd.sync()
-                        }
-                        if (downloadedBytes < MIN_VALID_AUDIO_BYTES) {
-                            throw DownloadProtocolException("Downloaded audio payload is too small")
-                        }
-                        if (totalLength > 0L && downloadedBytes != totalLength) {
-                            if (downloadedBytes < totalLength) {
-                                throw DownloadInterruptedException(
-                                    "Download truncated: received $downloadedBytes of $totalLength bytes",
-                                )
-                            }
-                            throw DownloadProtocolException(
-                                "Download exceeded expected size: received $downloadedBytes of $totalLength bytes",
-                            )
-                        }
-
-                        DownloadTransfer(
-                            bytesDownloaded = downloadedBytes,
-                            totalBytes = totalLength.takeIf { it > 0L } ?: downloadedBytes,
-                            contentType = currentResponse.header("Content-Type").orEmpty(),
-                        )
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        downloadedBytes += read
+                        onProgress(downloadedBytes, totalLength)
                     }
-                    if (continuation.isActive) continuation.resume(transfer)
-                } catch (error: Exception) {
-                    if (continuation.isActive) continuation.resumeWithException(error)
                 }
+                output.flush()
+                output.fd.sync()
             }
-        })
+            if (downloadedBytes < MIN_VALID_AUDIO_BYTES) {
+                throw DownloadProtocolException("Downloaded audio payload is too small")
+            }
+            if (totalLength > 0L && downloadedBytes != totalLength) {
+                if (downloadedBytes < totalLength) {
+                    throw DownloadInterruptedException(
+                        "Download truncated: received $downloadedBytes of $totalLength bytes",
+                    )
+                }
+                throw DownloadProtocolException(
+                    "Download exceeded expected size: received $downloadedBytes of $totalLength bytes",
+                )
+            }
+
+            DownloadTransfer(
+                bytesDownloaded = downloadedBytes,
+                totalBytes = totalLength.takeIf { it > 0L } ?: downloadedBytes,
+                contentType = currentResponse.header("Content-Type").orEmpty(),
+            )
+        }
     }
 
     private data class ParsedDashManifest(
@@ -2370,6 +2518,7 @@ class TrackDownloadManager @Inject constructor(
             // 1. Download initialization segment (0.mp4) containing ftyp and moov boxes
             val initReq = Request.Builder()
                 .url(initUrl)
+                .tag(DownloadRequestTag::class.java, downloadDiagnostics.tag(downloadKey, DownloadTrace.Role.AUDIO))
                 .apply {
                     headers.forEach { (k, v) -> addHeader(k, v) }
                     if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
@@ -2405,6 +2554,7 @@ class TrackDownloadManager @Inject constructor(
                 }
                 val segReq = Request.Builder()
                     .url(segUrl)
+                    .tag(DownloadRequestTag::class.java, downloadDiagnostics.tag(downloadKey, DownloadTrace.Role.AUDIO))
                     .apply {
                         headers.forEach { (k, v) -> addHeader(k, v) }
                         if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
@@ -2530,8 +2680,10 @@ class TrackDownloadManager @Inject constructor(
         requestHeaders: Map<String, String>,
         range: DownloadRange?,
         resumeOffset: Long = 0L,
+        downloadKey: String,
     ): Request {
         val builder = Request.Builder().url(url)
+            .tag(DownloadRequestTag::class.java, downloadDiagnostics.tag(downloadKey, DownloadTrace.Role.AUDIO))
         requestHeaders.forEach { (name, value) -> builder.header(name, value) }
         if (requestHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
             builder.header("User-Agent", DOWNLOAD_USER_AGENT)
@@ -2637,6 +2789,7 @@ class TrackDownloadManager @Inject constructor(
     }.getOrDefault(false)
 
     private fun updateProgress(progress: DownloadProgress) {
+        if (progress.isFinished && progress.error == null) retryRequests.remove(progress.key)
         _downloads.update { it + (progress.key to progress) }
     }
 
@@ -3084,16 +3237,16 @@ class TrackDownloadManager @Inject constructor(
     }
 
     /** Queued worker cancelled before it acquired a download slot. */
-    private fun forgetDownloadKey(key: String) {
+    private fun forgetDownloadKey(key: String, keepResult: Boolean = false) {
         activeKeys.remove(key)
         activeJobs.remove(key)
         reconnectGenerations.remove(key)
-        _downloads.update { it - key }
+        if (!keepResult) _downloads.update { it - key }
+        if (!keepResult || _downloads.value[key] == null) retryRequests.remove(key)
     }
 
-    /** Worker that already holds a slot must release it exactly once. */
-    private fun abandonAcquiredDownload(key: String) {
-        runCatching { downloadSlots.release() }
+    /** The pipeline lease owns all permits, including on an early return. */
+    private fun abandonDownload(key: String) {
         activeUris.remove(key)?.let { uri ->
             runCatching { context.contentResolver.delete(uri, null, null) }
         }

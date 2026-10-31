@@ -200,6 +200,12 @@ fun DownloadsScreen(
     val primaryArtistOnly by viewModel.primaryArtistOnly.collectAsStateWithLifecycle()
     val isOnline by viewModel.isOnline.collectAsStateWithLifecycle()
     val activeDownloads = activeDownloadsMap.values.filter { !it.isFinished && it.error == null }
+    val failedDownloads = activeDownloadsMap.values.count { it.error != null }
+    var showQueue by remember { mutableStateOf(false) }
+    if (showQueue) com.lastwave.app.ui.download.DownloadQueueSheet(
+        downloads = activeDownloadsMap.values.toList(), onDismiss = { showQueue = false },
+        onCancel = viewModel::cancelDownload, onRetry = viewModel::retryDownload, onReconnect = viewModel::reconnectDownload,
+    )
 
     val haptic = LocalHapticFeedback.current
     val musicPlayer = LocalMusicPlayer.current
@@ -309,26 +315,6 @@ fun DownloadsScreen(
                 subtitle = headerSubtitle,
                 onBack = headerBack,
                 actions = {
-                    if (activeDownloads.isNotEmpty()) {
-                        FilledTonalButton(
-                            onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                viewModel.cancelAllDownloads()
-                            },
-                            colors = androidx.compose.material3.ButtonDefaults.filledTonalButtonColors(
-                                containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f),
-                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                            ),
-                            shape = RoundedCornerShape(20.dp),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                            modifier = Modifier.height(34.dp),
-                        ) {
-                            Icon(Icons.Filled.Close, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Cancel All (${activeDownloads.size})", style = MaterialTheme.typography.labelSmall)
-                        }
-                        Spacer(Modifier.width(6.dp))
-                    }
                     Box {
                         IconButton(
                             onClick = {
@@ -474,6 +460,19 @@ fun DownloadsScreen(
                     }
                 },
             )
+
+            if (activeDownloadsMap.isNotEmpty()) FilledTonalButton(
+                onClick = { showQueue = true }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                contentPadding = PaddingValues(16.dp),
+            ) {
+                Icon(Icons.Filled.Download, null)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
+                    Text("Download queue", fontWeight = FontWeight.SemiBold)
+                    Text("${activeDownloads.size} active · $failedDownloads need attention", style = MaterialTheme.typography.bodySmall)
+                }
+                Text("Manage", style = MaterialTheme.typography.labelLarge)
+            }
 
             // Offline Mode Banner
             if (!isOnline) {

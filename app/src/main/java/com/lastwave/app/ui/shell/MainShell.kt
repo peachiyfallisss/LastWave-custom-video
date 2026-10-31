@@ -146,6 +146,8 @@ class MainShellViewModel @Inject constructor(
 ) : ViewModel() {
     val updateInfo = appUpdateManager.updateInfo
 
+    fun checkUpdatesOnResume() = appUpdateManager.checkForUpdate(isSilent = true)
+
     fun dismissUpdate(version: String) {
         appUpdateManager.dismissUpdate(version)
     }
@@ -220,6 +222,14 @@ fun MainShell(
         }
     }
     val updateInfo by mainShellViewModel.updateInfo.collectAsStateWithLifecycle()
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner, mainShellViewModel) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) mainShellViewModel.checkUpdatesOnResume()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     val showUpdateBanner = updateInfo.isUpdateAvailable && !updateInfo.isDismissed
     val backgroundColor = MaterialTheme.colorScheme.background
     // Unconditional remember keeps composition stable; usage gated below.
@@ -281,6 +291,9 @@ fun MainShell(
         ) {
             UpdatePromptCard(
                 version = updateInfo.latestVersion,
+                status = updateInfo.statusText,
+                action = updateInfo.actionLabel,
+                busy = updateInfo.isDownloading || updateInfo.isChecking,
                 onUpdate = { mainShellViewModel.openUpdate(context) },
                 onDismiss = { mainShellViewModel.dismissUpdate(updateInfo.latestVersion) },
             )
@@ -316,6 +329,9 @@ fun MainShell(
 @Composable
 private fun UpdatePromptCard(
     version: String,
+    status: String,
+    action: String,
+    busy: Boolean,
     onUpdate: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -345,7 +361,7 @@ private fun UpdatePromptCard(
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
                 Text(
-                    text = androidx.compose.ui.res.stringResource(com.lastwave.app.R.string.update_ready_to_install, version),
+                    text = status,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
                 )
@@ -355,10 +371,10 @@ private fun UpdatePromptCard(
                 color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier
                     .clip(RoundedCornerShape(14.dp))
-                    .clickable(onClick = onUpdate),
+                    .clickable(enabled = !busy, onClick = onUpdate),
             ) {
                 Text(
-                    text = androidx.compose.ui.res.stringResource(com.lastwave.app.R.string.update),
+                    text = action,
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onPrimary,

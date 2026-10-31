@@ -3,6 +3,10 @@ package com.lastwave.app.data.download
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
+import com.lastwave.app.data.music.ExpiringSingleFlightCache
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.ByteArrayOutputStream
@@ -11,7 +15,9 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.IOException
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -19,6 +25,28 @@ import javax.inject.Singleton
 class AudioTagWriter @Inject constructor(
     private val okHttpClient: OkHttpClient,
 ) {
+    // At most eight normalized covers (each <=2 MiB). Shared album URLs do not
+    // trigger a fresh fetch/bitmap decode for every song in the playlist.
+    private val artworkCache = ExpiringSingleFlightCache<String, ByteArray>(8, 5 * 60_000L)
+    private val artworkClient = okHttpClient.newBuilder().callTimeout(4, TimeUnit.SECONDS).build()
+
+    /** Start during preparation/transfer; never call the network from final tagging. */
+    suspend fun prepareArtworkBytes(artworkUrl: String?, fallbackUrl: String? = null): ByteArray? = withContext(Dispatchers.IO) {
+        for (url in listOfNotNull(artworkUrl, fallbackUrl).filter(String::isNotBlank).distinct()) {
+            try {
+                return@withContext artworkCache.get(url) {
+                    val request = Request.Builder().url(url)
+                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36").build()
+                    val raw = awaitDownloadResponse(artworkClient.newCall(request)) { response, active ->
+                        readArtworkResponse(response, active) ?: throw IOException("No artwork payload")
+                    }
+                    normalizedArtwork(raw) ?: throw IOException("Unsupported artwork image")
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { /* Cover art is optional; try the supplied fallback once. */ }
+        }
+        null
+    }
     companion object {
         private const val TAG = "AudioTagWriter"
         private const val FRAME_TITLE = "TIT2"
@@ -90,6 +118,20 @@ class AudioTagWriter @Inject constructor(
                     (downloadArtworkBytes(url) ?: downloadArtworkBytes(url))?.let(::normalizedArtwork)
                 }
 
+            embedPreparedMetadata(audioFile, title, artist, album, artworkBytes, lyrics, year)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Could not prepare tags into ${audioFile.name}: ${e.message}", e)
+            false
+        }
+    }
+
+    /** Local-only finalization: the caller owns artwork preparation and its wait budget. */
+    fun embedPreparedMetadata(
+        audioFile: File, title: String, artist: String, album: String? = null,
+        artworkBytes: ByteArray? = null, lyrics: String? = null, year: String? = null,
+    ): Boolean {
+        if (!audioFile.exists() || audioFile.length() <= 0) return false
+        return try {
             val kind = detectContainerKind(audioFile)
             val ok = when (kind) {
                 // A FLAC whose metadata chain doesn't parse cleanly is left
@@ -1658,30 +1700,31 @@ class AudioTagWriter @Inject constructor(
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                 .build()
             val response = okHttpClient.newCall(request).execute()
-            response.use { res ->
-                if (!res.isSuccessful) return null
-                val body = res.body ?: return null
-                if (body.contentLength() > MAX_ARTWORK_DOWNLOAD_BYTES) return null
-                val output = ByteArrayOutputStream(
-                    body.contentLength().coerceIn(0L, MAX_ARTWORK_DOWNLOAD_BYTES.toLong()).toInt(),
-                )
-                body.byteStream().use { input ->
-                    val buffer = ByteArray(32 * 1024)
-                    var total = 0
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        total += read
-                        if (total > MAX_ARTWORK_DOWNLOAD_BYTES) return null
-                        output.write(buffer, 0, read)
-                    }
-                }
-                output.toByteArray().takeIf { it.isNotEmpty() }
-            }
+            response.use { readArtworkResponse(it) { true } }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to download artwork for tagging: ${e.message}")
             null
         }
+    }
+
+    private fun readArtworkResponse(response: okhttp3.Response, active: () -> Boolean): ByteArray? {
+        if (!response.isSuccessful) return null
+        val body = response.body ?: return null
+        if (body.contentLength() > MAX_ARTWORK_DOWNLOAD_BYTES) return null
+        val output = ByteArrayOutputStream(body.contentLength().coerceIn(0L, MAX_ARTWORK_DOWNLOAD_BYTES.toLong()).toInt())
+        body.byteStream().use { input ->
+            val buffer = ByteArray(32 * 1024)
+            var total = 0
+            while (true) {
+                if (!active()) throw CancellationException("Artwork preparation cancelled")
+                val read = input.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > MAX_ARTWORK_DOWNLOAD_BYTES) return null
+                output.write(buffer, 0, read)
+            }
+        }
+        return output.toByteArray().takeIf { it.isNotEmpty() }
     }
 
     /** Normalizes arbitrary image bytes to plain JPEG/PNG (never WebP/HEIF). */

@@ -487,6 +487,7 @@ fun SettingsScreen(
     var showYtChannelSheet by remember { mutableStateOf(false) }
     var showYtDisconnectConfirm by remember { mutableStateOf(false) }
     var showLanguageDialog by remember { mutableStateOf(false) }
+    var showUpdateChannelDialog by remember { mutableStateOf(false) }
     val currentLanguage = remember(misc.appLanguageTag) { AppLanguage.fromTag(misc.appLanguageTag) }
 
     // Sends the user to Android's own Notification Listener access screen
@@ -1846,13 +1847,13 @@ fun SettingsScreen(
                                 }
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "Update Available!",
+                                        text = updateInfo.actionLabel,
                                         style = MaterialTheme.typography.titleMedium,
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                                     )
                                     Text(
-                                        text = "Version ${updateInfo.latestVersion} is ready to install",
+                                        text = updateInfo.statusText,
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
                                     )
@@ -1862,7 +1863,7 @@ fun SettingsScreen(
                                     color = MaterialTheme.colorScheme.primary,
                                 ) {
                                     Text(
-                                        text = "Update",
+                                        text = if (updateInfo.readyToInstall) "Install" else "Download",
                                         style = MaterialTheme.typography.labelMedium,
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onPrimary,
@@ -1876,17 +1877,25 @@ fun SettingsScreen(
 
                     AboutCard(versionName = appVersionName(context))
 
+                    if (updateInfo.supported) {
+                        SettingsActionCard(
+                            icon = Icons.Filled.CloudSync,
+                            iconContainer = MaterialTheme.colorScheme.secondaryContainer,
+                            iconTint = MaterialTheme.colorScheme.onSecondaryContainer,
+                            title = "Update channel: ${updateInfo.channel.label}",
+                            subtitle = if (updateInfo.channel == com.lastwave.app.data.update.UpdateChannel.AUTOMATIC)
+                                "Follows testing or stable releases automatically • Installed: ${updateInfo.installedChannel}"
+                                else "Only ${updateInfo.channel.label.lowercase()} builds • Installed: ${updateInfo.installedChannel}",
+                            onClick = { showUpdateChannelDialog = true },
+                        )
+                    }
+
                     SettingsActionCard(
                         icon = Icons.Filled.CloudDownload,
                         iconContainer = if (updateInfo.isUpdateAvailable) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.secondaryContainer,
                         iconTint = if (updateInfo.isUpdateAvailable) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSecondaryContainer,
-                        title = if (updateInfo.isUpdateAvailable) "Update Ready (${updateInfo.latestVersion})" else "Check for Updates",
-                        subtitle = when {
-                            updateInfo.isChecking -> "Checking GitHub releases..."
-                            updateInfo.isUpdateAvailable -> "Tap to download new version"
-                            !updateInfo.message.isNullOrBlank() -> updateInfo.message.orEmpty()
-                            else -> "Current version: ${appVersionName(context)}"
-                        },
+                        title = updateInfo.actionLabel,
+                        subtitle = updateInfo.statusText,
                         onClick = {
                             if (updateInfo.isUpdateAvailable) {
                                 viewModel.openUpdate(context)
@@ -1896,6 +1905,17 @@ fun SettingsScreen(
                         },
                         isHighlighted = (highlightedSettingId == "about.check_updates"),
                     )
+
+                    if (updateInfo.isDownloading) {
+                        SettingsActionCard(
+                            icon = Icons.Filled.Close,
+                            iconContainer = MaterialTheme.colorScheme.secondaryContainer,
+                            iconTint = MaterialTheme.colorScheme.onSecondaryContainer,
+                            title = "Cancel update download",
+                            subtitle = "Your installed app and music stay untouched",
+                            onClick = { viewModel.cancelUpdateDownload() },
+                        )
+                    }
 
                     SettingsActionCard(
                         icon = Icons.Filled.Code,
@@ -1975,6 +1995,38 @@ fun SettingsScreen(
     }
 
     // -- App language picker (Settings -> Language) --
+    if (showUpdateChannelDialog) {
+        AlertDialog(
+            onDismissRequest = { showUpdateChannelDialog = false },
+            title = { Text("Update channel") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    com.lastwave.app.data.update.UpdateChannel.entries.forEach { channel ->
+                        Row(Modifier.fillMaxWidth().clickable {
+                            viewModel.setUpdateChannel(channel)
+                            showUpdateChannelDialog = false
+                        }, verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(selected = updateInfo.channel == channel, onClick = {
+                                viewModel.setUpdateChannel(channel)
+                                showUpdateChannelDialog = false
+                            })
+                            Column(Modifier.weight(1f)) {
+                                Text(channel.label, style = MaterialTheme.typography.bodyLarge)
+                                Text(when (channel) {
+                                    com.lastwave.app.data.update.UpdateChannel.AUTOMATIC -> "Test builds while testing; stable releases afterward"
+                                    com.lastwave.app.data.update.UpdateChannel.STABLE -> "Only approved stable releases"
+                                    com.lastwave.app.data.update.UpdateChannel.TEST -> "Opt in to the latest published test builds"
+                                }, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                    Text("Switching back keeps your data. A newer stable build is needed; Android cannot downgrade apps.", style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = { TextButton(onClick = { showUpdateChannelDialog = false }) { Text("Done") } },
+        )
+    }
+
     if (showLanguageDialog) {
         AlertDialog(
             onDismissRequest = { showLanguageDialog = false },

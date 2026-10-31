@@ -8,8 +8,25 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      managed_channel:
+        description: 'Publish an in-app update (manual, trusted source only)'
+        type: choice
+        options: [none, test, stable]
+        default: none
+      activate:
+        description: 'Automatic users follow this channel after publication'
+        type: boolean
+        default: true
+      notes:
+        description: 'Update notes'
+        type: string
+        default: ''
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_channel != 'none' && 'lastwave-managed-updates' || format('lastwave-verify-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || inputs.managed_channel == 'none' }}
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,15 +48,60 @@ jobs:
         run: |
           bash tools/test-recording-identity.sh
           bash tools/test-playback-mode-cache.sh
+      - name: Verify managed publishing policy
+        run: python3 tools/test-managed-updates.py
+      - name: Restore permanent signing key for manually requested managed builds
+        if: github.event_name == 'workflow_dispatch' && inputs.managed_channel != 'none'
+        env:
+          MANAGED_KEY: ${{ secrets.MANAGED_UPDATES_KEYSTORE }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = peachiyfallisss/LastWave-custom-video
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          value = os.environ['MANAGED_KEY'].strip()
+          assert value, 'Configure the permanent managed signing secrets first'
+          key = Path(os.environ['RUNNER_TEMP']) / 'lastwave-updates.p12'
+          key.write_bytes(base64.b64decode(value, validate=True))
+          key.chmod(0o600)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'LASTWAVE_UPDATES_KEYSTORE={key}\n')
+              env.write(f'MANAGED_VERSION_CODE={1000000 + int(os.environ["GITHUB_RUN_NUMBER"])}\n')
+          PY
       - name: Test and build APK
-        run: bash gradlew testDebugUnitTest assembleDebug --console=plain --stacktrace
+        env:
+          MANAGED_CHANNEL: ${{ inputs.managed_channel || 'none' }}
+          LASTWAVE_UPDATES_PASSWORD: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_channel != 'none' && secrets.MANAGED_UPDATES_PASSWORD || '' }}
+          REWORK_PREVIEW: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$MANAGED_CHANNEL" != none ]; then
+            bash gradlew testDebugUnitTest assembleDebug -PmanagedUpdates=true -PmanagedChannel="$MANAGED_CHANNEL" -PmanagedVersionCode="$MANAGED_VERSION_CODE" --console=plain --stacktrace
+          else
+            bash gradlew testDebugUnitTest assembleDebug -PreworkPreview="$REWORK_PREVIEW" --console=plain --stacktrace
+          fi
       - name: Verify APK signature and package
+        env:
+          MANAGED_CHANNEL: ${{ inputs.managed_channel || 'none' }}
+          MANAGED_NOTES: ${{ inputs.notes }}
         run: |
           apk=app/build/outputs/apk/debug/app-debug.apk
           apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)
-          "$apksigner" verify --verbose "$apk"
+          "$apksigner" verify --verbose --print-certs "$apk"
           "$(dirname "$apksigner")/aapt" dump badging "$apk" | grep -E '^(package:|sdkVersion:|targetSdkVersion:|native-code:)'
+          expected_package=com.lastwave.app.custom
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then expected_package=com.lastwave.app.custom.rework; fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$MANAGED_CHANNEL" != none ]; then expected_package=com.lastwave.app.custom.updates; fi
+          "$(dirname "$apksigner")/aapt" dump badging "$apk" | grep -F "package: name='$expected_package'"
           sha256sum "$apk" > "$apk.sha256"
+          if [ "$expected_package" = com.lastwave.app.custom.updates ]; then
+            apksig=$(find "$HOME/.gradle/caches/modules-2/files-2.1/com.android.tools.build/apksig" -name '*.jar' | sort -V | tail -n 1)
+            test -n "$apksig"
+            mkdir -p "$RUNNER_TEMP/managed-apk-verifier"
+            javac --release 17 -cp "$apksig" -d "$RUNNER_TEMP/managed-apk-verifier" tools/VerifyManagedApk.java
+            python3 tools/publish-managed-update.py prepare --apk "$apk" --aapt "$(dirname "$apksigner")/aapt" --verifier-classpath "$RUNNER_TEMP/managed-apk-verifier:$apksig" --channel "$MANAGED_CHANNEL" --code "$MANAGED_VERSION_CODE" --source "$GITHUB_SHA"
+          fi
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -54,3 +116,39 @@ jobs:
             app/build/outputs/apk/debug/*.apk
             app/build/outputs/apk/debug/*.sha256
           if-no-files-found: error
+      - name: Upload managed update bundle
+        if: github.event_name == 'workflow_dispatch' && inputs.managed_channel != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LastWave-managed-updates
+          path: managed-dist/
+          if-no-files-found: error
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/lastwave-updates.p12"
+  publish-managed:
+    if: github.repository == 'peachiyfallisss/LastWave-custom-video' && github.event_name == 'workflow_dispatch' && inputs.managed_channel != 'none'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      MANAGED_CHANNEL: ${{ inputs.managed_channel }}
+      ACTIVATE: ${{ inputs.activate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: LastWave-managed-updates
+          path: managed-dist
+      - name: Publish verified APK and channel feed
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$ACTIVATE" = true ]; then args+=(--activate); fi
+          python3 tools/publish-managed-update.py publish --channel "$MANAGED_CHANNEL" --code "$((1000000 + GITHUB_RUN_NUMBER))" --source "$GITHUB_SHA" "${args[@]}"

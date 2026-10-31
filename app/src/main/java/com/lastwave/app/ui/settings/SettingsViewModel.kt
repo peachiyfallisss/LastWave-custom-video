@@ -112,6 +112,8 @@ class SettingsViewModel @Inject constructor(
     val authState: StateFlow<com.lastwave.app.data.model.AuthState> = authRepository.authState
     val updateInfo = appUpdateManager.updateInfo
 
+    fun setUpdateChannel(channel: com.lastwave.app.data.update.UpdateChannel) = appUpdateManager.selectChannel(channel)
+    fun cancelUpdateDownload() = appUpdateManager.cancelUpdateDownload()
     fun checkForUpdates() = appUpdateManager.checkForUpdate(isSilent = false)
     fun openUpdate(context: android.content.Context) = appUpdateManager.openUpdate(context)
 
@@ -833,6 +835,8 @@ class SettingsViewModel @Inject constructor(
         sb.appendLine(readCrashReports())
         sb.appendLine("---- startup trail (how far the last launches got) ----")
         sb.appendLine(runCatching { com.lastwave.app.StartupTrail.readTail(context) }.getOrDefault("(startup trail unavailable)"))
+        sb.appendLine("---- download timings (no track titles or URLs in this section) ----")
+        sb.appendLine(downloadManager.downloadTimingReport())
         sb.appendLine("---- logcat (this process) ----")
         sb.append(readOwnLogcat())
         sb.appendLine("---- end ----")

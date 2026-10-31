@@ -11,6 +11,18 @@ plugins {
     alias(libs.plugins.hilt)
 }
 
+// PR previews install alongside the user's existing custom app, regardless of debug signing key.
+val reworkPreview = providers.gradleProperty("reworkPreview").getOrElse("false").toBoolean()
+// Both managed channels deliberately share one package and one permanent key.
+val managedUpdates = providers.gradleProperty("managedUpdates").getOrElse("false").toBoolean()
+val managedChannel = providers.gradleProperty("managedChannel").getOrElse("test")
+val updateDataSchema = Regex("version\\s*=\\s*(\\d+)").find(file("src/main/java/com/lastwave/app/data/local/db/AppDatabase.kt").readText())?.groupValues?.get(1)?.toInt() ?: error("Missing database version")
+val managedVersionCode = providers.gradleProperty("managedVersionCode").orNull?.toIntOrNull()
+if (managedUpdates) {
+    require(managedChannel in setOf("test", "stable")) { "Invalid managed update channel" }
+    require(managedVersionCode != null && managedVersionCode > 0) { "A monotonic managedVersionCode is required" }
+}
+
 android {
     namespace = "com.lastwave.app"
     compileSdk = 37
@@ -61,8 +73,12 @@ android {
         applicationId = "com.lastwave.app"
         minSdk = (project.findProperty("minSdk") as? String)?.toIntOrNull() ?: 29
         targetSdk = 35
-        versionCode = 27
+        versionCode = if (managedUpdates) managedVersionCode!! else 29
         versionName = "4.2.2"
+        manifestPlaceholders["appLabel"] = "@string/app_name"
+        manifestPlaceholders["updateDataSchema"] = updateDataSchema
+        buildConfigField("int", "UPDATE_DATA_SCHEMA", updateDataSchema.toString())
+        buildConfigField("String", "UPDATE_CHANNEL", "\"${if (managedUpdates) managedChannel else "unmanaged"}\"")
 
         // Native secrets (addon client lock) live strictly in native .so via
         // SecretsBridge_generated.h (tools/generate_native_secrets.py).
@@ -85,6 +101,22 @@ android {
     }
 
     signingConfigs {
+        if (managedUpdates) {
+            create("managed_updates") {
+                val path = System.getenv("LASTWAVE_UPDATES_KEYSTORE")
+                val password = System.getenv("LASTWAVE_UPDATES_PASSWORD")?.trim()
+                require(!path.isNullOrBlank() && file(path).isFile && !password.isNullOrBlank()) {
+                    "Managed builds require the permanent signing key; random debug signing is forbidden"
+                }
+                storeFile = file(path)
+                storePassword = password
+                keyAlias = "lastwave_updates"
+                keyPassword = password
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
         create("release_config") {
             val base64Key = resolveSecret("SIGNING_KEY")
             val storeFilePath = resolveSecret("RELEASE_STORE_FILE")
@@ -138,9 +170,14 @@ android {
             // proguardFiles from initWith are ignored when minify is off
         }
         debug {
-            isDebuggable = true
-            applicationIdSuffix = ".custom"
-            versionNameSuffix = "-custom-video.8"
+            isDebuggable = !managedUpdates
+            applicationIdSuffix = when { managedUpdates -> ".custom.updates"; reworkPreview -> ".custom.rework"; else -> ".custom" }
+            versionNameSuffix = if (managedUpdates) "-$managedChannel.$managedVersionCode"
+                else "-custom-video.10" + if (reworkPreview) "-preview" else ""
+            if (managedUpdates) {
+                signingConfig = signingConfigs.getByName("managed_updates")
+                manifestPlaceholders["appLabel"] = "LastWave Updates"
+            } else if (reworkPreview) manifestPlaceholders["appLabel"] = "LastWave Rework Preview"
         }
     }
 
@@ -282,6 +319,7 @@ dependencies {
 
     // Unit Testing dependencies
     testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation("com.google.truth:truth:1.4.2")
     testImplementation("org.robolectric:robolectric:4.12.2")
     testImplementation("io.mockk:mockk:1.13.10")

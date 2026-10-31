@@ -1,6 +1,11 @@
 package com.lastwave.app.data.music
 
 import android.net.Uri
+import com.lastwave.app.data.download.awaitDownloadResponse
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.asContextElement
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -26,18 +31,32 @@ import javax.inject.Singleton
 class YouTubeStreamExtractor @Inject constructor(
     http: OkHttpClient,
 ) {
-    private val downloader = OkHttpNewPipeDownloader(http)
+    private val extractionJob = ThreadLocal<Job?>()
+    private val downloader = OkHttpNewPipeDownloader(http, extractionJob)
+    // NewPipe's anonymous response contains both audio and video formats.
+    // Reuse it for the same exact recording, never for a title/artist match.
+    private val infoCache = ExpiringSingleFlightCache<String, StreamInfo>(16, 90_000L)
 
     @Volatile
     private var initialized = false
 
-    fun invalidateCache(@Suppress("UNUSED_PARAMETER") videoId: String) = Unit
+    fun invalidateCache(videoId: String) = infoCache.invalidate(videoId)
+
+    private suspend fun streamInfo(videoId: String): StreamInfo = infoCache.get(videoId, expiresAt = { info ->
+        (info.audioStreams.map { it.content } + info.videoStreams.map { it.content } + info.videoOnlyStreams.map { it.content })
+            .mapNotNull { it.toHttpUrlOrNull()?.queryParameter("expire")?.toLongOrNull()?.times(1_000L) }
+            .minOrNull()?.minus(120_000L)
+    }) {
+        initialize()
+        withContext(Dispatchers.IO + extractionJob.asContextElement(currentCoroutineContext()[Job])) {
+            StreamInfo.getInfo(ServiceList.YouTube, "https://www.youtube.com/watch?v=$videoId")
+        }
+    }
 
     suspend fun resolveAudioStream(videoId: String, preferM4a: Boolean = false): YouTubeAudioStream = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
-        initialize()
         val info = try {
-            StreamInfo.getInfo(ServiceList.YouTube, "https://www.youtube.com/watch?v=$videoId")
+            streamInfo(videoId)
         } catch (error: kotlinx.coroutines.CancellationException) {
             throw error
         } catch (error: Exception) {
@@ -85,8 +104,7 @@ class YouTubeStreamExtractor @Inject constructor(
     /** Resolve the chosen video's own soundtrack; never search for another recording. */
     suspend fun resolveVideoStream(videoId: String, cacheKey: String): com.lastwave.app.playback.MusicPlayer.ResolvedStream =
         withContext(Dispatchers.IO) {
-            initialize()
-            val info = StreamInfo.getInfo(ServiceList.YouTube, "https://www.youtube.com/watch?v=$videoId")
+            val info = streamInfo(videoId)
             val videos = (info.videoStreams + info.videoOnlyStreams).filter { it.isUrl && it.content.startsWith("https://") }
             val video = videos.filter { it.height in 1..1080 }.maxByOrNull { it.height }
                 ?: videos.maxByOrNull { Regex("[0-9]+").find(it.resolution)?.value?.toIntOrNull() ?: 0 }
@@ -107,6 +125,7 @@ class YouTubeStreamExtractor @Inject constructor(
                 url = video.content, mimeType = video.format?.mimeType ?: "video/mp4",
                 bitrateKbps = audio?.bitrateKbps, audioCodec = audio?.audioCodec,
                 cacheKey = cacheKey, requestHeaders = headers, durationMs = duration, companionAudio = audio,
+                videoHeight = video.height.takeIf { it > 0 } ?: Regex("[0-9]+").find(video.resolution)?.value?.toIntOrNull(),
                 expiresAtEpochMs = video.content.toHttpUrlOrNull()?.queryParameter("expire")?.toLongOrNull()?.times(1_000L),
             )
         }
@@ -194,6 +213,7 @@ internal const val YOUTUBE_ORIGIN = "https://www.youtube.com"
 
 private class OkHttpNewPipeDownloader(
     private val http: OkHttpClient,
+    private val extractionJob: ThreadLocal<Job?>,
 ) : Downloader() {
     override fun execute(request: Request): Response {
         val headers = request.headers()
@@ -222,7 +242,8 @@ private class OkHttpNewPipeDownloader(
             requestBuilder.header("Referer", "$origin/")
         }
 
-        return http.newCall(requestBuilder.build()).execute().use { response ->
+        val call = http.newCall(requestBuilder.build())
+        fun convert(response: okhttp3.Response): Response =
             Response(
                 response.code,
                 response.message,
@@ -230,7 +251,13 @@ private class OkHttpNewPipeDownloader(
                 response.body?.string().orEmpty(),
                 response.request.url.toString(),
             )
-        }
+        // Bridge NewPipe's synchronous API to a cancellable/joined HTTP read.
+        // A timed-out download extraction must not leave sockets running behind
+        // the fallback or cache an abandoned result.
+        val parent = extractionJob.get()
+        return if (parent != null) runBlocking(parent) {
+            awaitDownloadResponse(call) { response, _ -> convert(response) }
+        } else call.execute().use(::convert)
     }
 }
 

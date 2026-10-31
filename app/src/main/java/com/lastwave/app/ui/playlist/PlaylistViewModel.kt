@@ -24,6 +24,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -574,25 +578,31 @@ class PlaylistViewModel @Inject constructor(
             }
             var queued = 0
             var skipped = 0
-            for (track in tracks) {
-                if (track.name.isBlank()) {
-                    skipped++
-                    continue
+            // Bounded parallel disk/DAO checks keep large playlists feeding the
+            // pipeline without a serial filesystem scan between every enqueue.
+            // Preserve playlist order and avoid launching one coroutine per song.
+            for (batch in tracks.chunked(4)) {
+                val candidates = coroutineScope {
+                    batch.map { track -> async(Dispatchers.IO) {
+                        if (track.name.isBlank() || trackDownloadManager.isDownloading(track.name, track.artist)) {
+                            track to false
+                        } else {
+                            val saved = try {
+                                trackDownloadManager.isTrackDownloaded(track.name, track.artist, track.youtubeVideoIdOrNull())
+                            } catch (cancelled: CancellationException) { throw cancelled }
+                            catch (_: Exception) { false }
+                            val complete = saved && (!includeVideo || trackDownloadManager.isVideoDownloaded(
+                                track.name, track.artist, track.album, track.youtubeVideoIdOrNull()))
+                            track to !complete
+                        }
+                    } }.awaitAll()
                 }
-                if (trackDownloadManager.isDownloading(track.name, track.artist)) {
-                    skipped++
-                    continue
+                for ((track, needsDownload) in candidates) {
+                    if (!needsDownload) { skipped++; continue }
+                    trackDownloadManager.downloadTrack(track.name, track.artist, track.album, track.artworkUrl,
+                        videoId = track.youtubeVideoIdOrNull(), includeVideo = includeVideo)
+                    queued++
                 }
-                val alreadyDownloaded = runCatching {
-                    trackDownloadManager.isTrackDownloaded(track.name, track.artist, track.youtubeVideoIdOrNull())
-                }.getOrDefault(false)
-                if (alreadyDownloaded && (!includeVideo || trackDownloadManager.isVideoDownloaded(track.name, track.artist, track.album, track.youtubeVideoIdOrNull()))) {
-                    skipped++
-                    continue
-                }
-                trackDownloadManager.downloadTrack(track.name, track.artist, track.album, track.artworkUrl,
-                    videoId = track.youtubeVideoIdOrNull(), includeVideo = includeVideo)
-                queued++
             }
             _uiState.update {
                 it.copy(

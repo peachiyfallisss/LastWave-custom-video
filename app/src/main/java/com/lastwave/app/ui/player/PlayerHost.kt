@@ -292,6 +292,7 @@ class PlayerViewModel @Inject constructor(
     val player: MusicPlayer,
     private val playlistRepository: PlaylistRepository,
     private val lyricsRepository: LyricsRepository,
+    private val customLyricsRepository: com.lastwave.app.data.lyrics.CustomLyricsRepository,
     private val canvasRepository: com.lastwave.app.data.canvas.CanvasRepository,
     private val settingsPreferences: com.lastwave.app.data.local.SettingsPreferences,
     val navigator: com.lastwave.app.ui.navigation.ArtistAlbumNavigator,
@@ -307,6 +308,13 @@ class PlayerViewModel @Inject constructor(
     val state = player.state
     val chromeState = player.chromeState
     val progressState = player.progressState
+    private val listeningState = player.state.map { com.lastwave.app.playback.concertListeningState(it) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, com.lastwave.app.playback.concertListeningState(player.state.value))
+    val lyricsPlayerState = listeningState.map { it.copy(positionMs = 0L, bufferedPositionMs = 0L) }
+        .distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, listeningState.value)
+    val lyricsProgressState = listeningState.map {
+        PlaybackProgressState(positionMs = it.positionMs, durationMs = it.durationMs)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, PlaybackProgressState())
     val fullPlayerState = player.state
         .map { it.copy(positionMs = 0L, bufferedPositionMs = 0L) }
         .distinctUntilChanged()
@@ -347,6 +355,18 @@ class PlayerViewModel @Inject constructor(
 
     private val _lyricsState = MutableStateFlow<LyricsUiState>(LyricsUiState.Idle)
     val lyricsState = _lyricsState.asStateFlow()
+    private val _lyricsRecordingKey = MutableStateFlow<String?>(null)
+    val lyricsRecordingKey = _lyricsRecordingKey.asStateFlow()
+
+    private fun recordingLyricsKey(track: PlayableTrack): String {
+        val mode = player.videoState.value
+        val source = track.videoSourceUrl ?: if (mode.enabled) mode.source else null
+        return com.lastwave.app.data.lyrics.customLyricsKey(
+            track.videoId, track.title, track.artist, track.playbackUrl, source,
+            track.videoSegmentStartMs ?: if (mode.enabled) mode.segmentStartMs else null,
+            track.videoSegmentEndMs ?: if (mode.enabled) mode.segmentEndMs else null,
+        )
+    }
 
     private var currentTrackLyricsKey: String? = null
     private var lyricsJob: Job? = null
@@ -375,12 +395,16 @@ class PlayerViewModel @Inject constructor(
         }
         viewModelScope.launch {
             combine(
-                player.chromeState.map { it.current }.distinctUntilChanged(),
+                listeningState.map { it.current }.distinctUntilChanged(),
                 settingsPreferences.settings.map { it.wordByWordLyrics }.distinctUntilChanged(),
-            ) { track, wordByWord -> track to wordByWord }.collect { (track, wordByWord) ->
-                val key = track?.let { "${it.videoId ?: ""}|${it.artist}|${it.title}|$wordByWord" }
+                player.videoState.map { listOf(it.enabled, it.source, it.segmentStartMs, it.segmentEndMs) }.distinctUntilChanged(),
+            ) { track, wordByWord, _ -> track to wordByWord }.collect { (track, wordByWord) ->
+                val recordingKey = track?.let(::recordingLyricsKey)
+                val key = recordingKey?.let { "$it|$wordByWord" }
                 if (key != currentTrackLyricsKey) {
                     currentTrackLyricsKey = key
+                    _lyricsRecordingKey.value = recordingKey
+                    _lyricsState.value = LyricsUiState.Loading
                     if (track != null) {
                         loadLyrics(track, forceRefresh = false)
                     } else {
@@ -435,6 +459,7 @@ class PlayerViewModel @Inject constructor(
 
     fun loadLyrics(track: PlayableTrack, forceRefresh: Boolean = false) {
         lyricsJob?.cancel()
+        val recordingKey = recordingLyricsKey(track)
         lyricsJob = viewModelScope.launch {
             // Hold the previous track's lyrics instead of flashing the
             // spinner on every change: cache hits resolve in milliseconds,
@@ -444,12 +469,12 @@ class PlayerViewModel @Inject constructor(
                 _lyricsState.value = LyricsUiState.Loading
             }
             try {
-                val durationSeconds = if (player.state.value.durationMs > 0) {
-                    (player.state.value.durationMs / 1000).toInt()
+                val durationSeconds = if (listeningState.value.durationMs > 0) {
+                    (listeningState.value.durationMs / 1000).toInt()
                 } else null
 
                 val result = try {
-                    lyricsRepository.getLyrics(
+                    customLyricsRepository.get(recordingKey)?.result() ?: lyricsRepository.getLyrics(
                         title = track.title,
                         artist = track.artist,
                         album = track.album,
@@ -485,7 +510,8 @@ class PlayerViewModel @Inject constructor(
         // never paint the previous song's lyrics over the new one. The job
         // cancel covers most of it; this covers the already-posted tail.
         if (wanted != null) {
-            val current = player.state.value.current
+            val current = listeningState.value.current
+            if (current == null || recordingLyricsKey(wanted) != recordingLyricsKey(current)) return
             val same = if (!wanted.videoId.isNullOrBlank() || !current?.videoId.isNullOrBlank()) {
                 !wanted.videoId.isNullOrBlank() && wanted.videoId == current?.videoId
             } else {
@@ -504,7 +530,7 @@ class PlayerViewModel @Inject constructor(
                 // and punctuation render as authored. Word-sync rows render
                 // word-by-word; rows without syllables fall back to
                 // line-by-line focus on the same clock.
-                val lines = if (result.isSynced && result.lines.isNotEmpty() && !result.isInstrumental) {
+                val lines = if (!result.isCustom && result.isSynced && result.lines.isNotEmpty() && !result.isInstrumental) {
                     com.lastwave.app.ui.player.normalizeWordSpacing(
                         com.lastwave.app.data.lyrics.LyricsRepository.mergeContinuationLines(
                             com.lastwave.app.data.lyrics.LyricsRepository.normalizeLyricTiming(result.lines),
@@ -530,7 +556,7 @@ class PlayerViewModel @Inject constructor(
     }
 
     fun retryLyrics() {
-        val track = player.state.value.current ?: return
+        val track = listeningState.value.current ?: return
         loadLyrics(track, forceRefresh = true)
     }
 
@@ -816,10 +842,15 @@ private fun ExpandedPlayer(
 ) {
     val state by viewModel.fullPlayerState.collectAsStateWithLifecycle()
     val lyricsState by viewModel.lyricsState.collectAsStateWithLifecycle()
+    val lyricPlaybackState by viewModel.lyricsPlayerState.collectAsStateWithLifecycle()
+    val recordingKey by viewModel.lyricsRecordingKey.collectAsStateWithLifecycle()
+    var showCustomLyrics by remember(recordingKey) { mutableStateOf(false) }
     val canvas by viewModel.canvasState.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val likedTrackKeys by viewModel.likedTrackKeys.collectAsStateWithLifecycle()
     val currentTrack = state.current
+    val lyricTrack = lyricPlaybackState.current
+    val lyricSeekOffset = if (currentTrack?.concertSegments?.isNotEmpty() == true) lyricTrack?.videoSegmentStartMs ?: 0L else 0L
     // Normalized key: raw "title|artist".lowercase() would miss liked entries
     // whose spacing differs (e.g. trailing space from another source).
     val isLiked = currentTrack != null &&
@@ -829,6 +860,10 @@ private fun ExpandedPlayer(
         progressState = viewModel.progressState,
         player = viewModel.player,
         lyricsState = lyricsState,
+        onEditLyrics = { showCustomLyrics = true },
+        lyricsPlaybackState = lyricPlaybackState,
+        lyricsProgressState = viewModel.lyricsProgressState,
+        lyricsSeekOffsetMs = lyricSeekOffset,
         lyricsUiVersion = settings.lyricsUiVersion,
         lyricsAnimation = settings.lyricsAnimation,
         wavySeekbarEnabled = settings.wavySeekbarEnabled,
@@ -852,6 +887,19 @@ private fun ExpandedPlayer(
         onDoubleTapLike = { currentTrack?.let(viewModel::like) },
         onDragStatusChange = onDragStatusChange,
     )
+    if (showCustomLyrics && lyricTrack != null && recordingKey != null) {
+        CustomLyricsEditor(
+            recordingKey = recordingKey!!,
+            title = lyricTrack.title,
+            artist = lyricTrack.artist,
+            baseline = lyricsState as? LyricsUiState.Success,
+            player = viewModel.player,
+            timelineStartMs = lyricSeekOffset,
+            timelineDurationMs = lyricTrack.durationMs,
+            onSaved = viewModel::retryLyrics,
+            onDismiss = { showCustomLyrics = false },
+        )
+    }
 }
 
 @Composable
@@ -1640,6 +1688,10 @@ private fun FullPlayer(
     progressState: StateFlow<PlaybackProgressState>,
     player: MusicPlayer,
     lyricsState: LyricsUiState,
+    onEditLyrics: () -> Unit,
+    lyricsPlaybackState: MusicPlayerState,
+    lyricsProgressState: StateFlow<PlaybackProgressState>,
+    lyricsSeekOffsetMs: Long = 0L,
     lyricsUiVersion: LyricsUiVersion = LyricsUiVersion.MODERN,
     lyricsAnimation: LyricsAnimation = LyricsAnimation.APPLE_FLUID,
     wavySeekbarEnabled: Boolean = true,
@@ -2222,12 +2274,18 @@ private fun FullPlayer(
                                     }
                                 },
                             ) {
-                                if (lyricsUiVersion == LyricsUiVersion.MODERN) {
+                                if (lyricsPlaybackState.current == null) {
+                                    Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                                        Text("No song is linked to this part of the concert.", style = MaterialTheme.typography.bodyLarge)
+                                    }
+                                } else if (lyricsUiVersion == LyricsUiVersion.MODERN) {
                                     ModernLyricsPanel(
-                                        state = state,
+                                        state = lyricsPlaybackState,
                                         player = player,
                                         lyricsState = lyricsState,
-                                        progressState = progressState,
+                                        onEditLyrics = onEditLyrics,
+                                        progressState = lyricsProgressState,
+                                        seekOffsetMs = lyricsSeekOffsetMs,
                                         wavySeekbarEnabled = wavySeekbarEnabled,
                                         lyricsOffsetMs = lyricsOffsetMs,
                                         lyricsFontScale = lyricsFontScale,
@@ -2245,10 +2303,12 @@ private fun FullPlayer(
                                     )
                                 } else {
                                     LyricsPanel(
-                                        state = state,
-                                        progressState = progressState,
+                                        state = lyricsPlaybackState,
+                                        progressState = lyricsProgressState,
+                                        seekOffsetMs = lyricsSeekOffsetMs,
                                         player = player,
                                         lyricsState = lyricsState,
+                                        onEditLyrics = onEditLyrics,
                                         lyricsAnimation = lyricsAnimation,
                                         wavySeekbarEnabled = wavySeekbarEnabled,
                                         lyricsOffsetMs = lyricsOffsetMs,

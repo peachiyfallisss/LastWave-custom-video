@@ -23,10 +23,22 @@ import okhttp3.ResponseBody
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import javax.inject.Singleton
+import javax.inject.Named
 
 @Module
 @InstallIn(SingletonComponent::class)
 object NetworkModule {
+    /** No music-account cookies, authorization interceptors, logging, or shared cache. */
+    @Provides
+    @Singleton
+    @Named("updates")
+    fun provideUpdateHttpClient(): OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(10, TimeUnit.MINUTES)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
 
     // Metadata/JSON responses are small; a large HTTP cache only duplicates
     // data already held by Room and the dedicated artwork/media caches.
