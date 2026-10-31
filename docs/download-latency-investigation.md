@@ -115,3 +115,47 @@ audio/video extraction or optional enrichment can be investigated separately
 after checking the dominant bottleneck. Persisted crashes from older build
 1000036 in the report are not evidence of a new crash in the captured 1000040
 download jobs, which all completed successfully.
+
+## Follow-up: lookup and final processing
+
+The user reports a major improvement after the range-transfer build 1000043.
+No numeric post-range phone capture has been provided yet. The next change
+addresses identifiable work in the remaining lookup/finalization paths:
+
+- Downloads first reuse a fresh authentication-scoped audio URL, then immediately
+  try the NewPipe extractor that succeeded in the phone capture. Previously,
+  that extractor ran only after a playback-client stage with a 4-second budget.
+  The full playback resolver remains a fallback for anonymous-extraction failure
+  (including recordings that need the authenticated path). Extraction has a
+  6-second budget. Parent cancellation is not treated as a reason to start a fallback.
+- NewPipe's anonymous StreamInfo response is reused for both audio and video of
+  the **same video ID**. Same-ID concurrent callers coalesce; unrelated recordings
+  do not block each other. The process-only LRU holds at most 16 responses for
+  90 seconds, never beyond the earliest supplied signed-URL expiry minus two
+  minutes. Rejected URL invalidation evicts the response; an old in-flight load
+  cannot repopulate the invalidated entry. Account credentials/responses are not
+  placed in this anonymous cache.
+- The synchronous NewPipe downloader bridges into cancellable HTTP reads, tied
+  to the extraction caller's job, so a timeout/cancellation cancels and joins its
+  active HTTP reader instead of leaving work behind the fallback.
+- Actual cover-image download and normalization start during preparation, not
+  inside final tagging. Same cover URLs share an 8-entry/5-minute normalized-image
+  cache (maximum 16 MiB at the existing 2 MiB per-cover limit). Final tagging uses
+  only prepared bytes and keeps the existing 500 ms optional-artwork wait budget;
+  it never starts a second synchronous download/retry chain. Slow/unavailable
+  optional artwork can be omitted while title/artist/album/lyrics still get tagged;
+  its source URL remains available to the app and missing art is reported honestly.
+  No extra background retagging or writes to published files are introduced.
+
+Audio bitrate selection is not lowered to AAC/M4A just to avoid remuxing. Video
+quality, byte-range transfers, exact recording/soundtrack preservation, public
+storage destinations, metadata/lyrics embedding, and playlist admission limits
+are retained. This change does not replace the user's files with an encrypted
+cache, remove tags, skip publication validation, or claim YouTube Music parity.
+
+Finishing now reports REMUX (including provider conversion when relevant),
+FILE_METADATA, LYRICS_WAIT, ARTWORK_WAIT, TAG_WRITE, PUBLIC_COPY (including lyrics
+sidecars), and DB_PUBLISH separately. ARTWORK_PREPARE overlaps resolution and
+transfers and is **not** additional serial finishing time. A new phone report is
+still needed to measure the actual lookup/finishing improvement and establish
+whether remuxing, metadata extraction, or storage copies are the next bottleneck.

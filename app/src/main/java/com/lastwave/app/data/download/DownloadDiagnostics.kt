@@ -24,6 +24,10 @@ class DownloadDiagnostics @Inject constructor() {
     internal fun finish(key: String, id: Long, outcome: String) { ids.remove(key, id); trace.finish(id, outcome) }
     internal fun tag(key: String, role: DownloadTrace.Role) = ids[key]?.let { DownloadRequestTag(it, role) }
     fun report(): String = trace.report()
+    internal suspend fun <T> phase(id: Long, phase: DownloadTrace.Phase, block: suspend () -> T): T {
+        trace.startPhase(id, phase)
+        return try { block() } finally { trace.endPhase(id, phase) }
+    }
 
     internal val listenerFactory = EventListener.Factory { call ->
         val tag = call.request().tag(DownloadRequestTag::class.java)

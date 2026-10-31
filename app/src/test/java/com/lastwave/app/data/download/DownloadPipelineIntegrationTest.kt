@@ -71,12 +71,13 @@ class DownloadPipelineIntegrationTest {
         coEvery { dao.findByTitleAndArtist(any(), any()) } returns null
         coEvery { dao.insert(any()) } answers { firstArg<DownloadedTrackEntity>().let { rows[it.trackKey] = it }; 1L }
         coEvery { innerTube.peekCachedStream(any()) } returns null
-        coEvery { innerTube.resolveAudioStream(any()) } answers {
+        coEvery { innerTube.resolveDownloadStream(any()) } answers {
             val id = firstArg<String>()
             YouTubeAudioStream(id, "https://example.test/$id", 1, "audio/mpeg", "mp3", 128_000,
                 44_100, 1_000, 4_096, true, "test", "test")
         }
-        every { tagger.embedMetadata(any(), any(), any(), any(), any(), any(), any(), any()) } returns true
+        coEvery { tagger.prepareArtworkBytes(any(), any()) } returns null
+        every { tagger.embedPreparedMetadata(any(), any(), any(), any(), any(), any(), any()) } returns true
         coEvery { videos.prepareDownload(any(), any()) } answers {
             val track = firstArg<com.lastwave.app.playback.PlayableTrack>()
             pending.getOrPut(track.title) { mockk(relaxed = true) }
@@ -123,7 +124,7 @@ class DownloadPipelineIntegrationTest {
                 check(bothTransfers.await(5, TimeUnit.SECONDS)) { "Main audio and video were serialized" }
             } else secondTransfer.countDown()
         }
-        every { tagger.embedMetadata(any(), "First", any(), any(), any(), any(), any(), any()) } answers {
+        every { tagger.embedPreparedMetadata(any(), "First", any(), any(), any(), any(), any()) } answers {
             tagEntered.countDown()
             check(releaseTag.await(5, TimeUnit.SECONDS))
             true
@@ -142,7 +143,7 @@ class DownloadPipelineIntegrationTest {
     }
 
     @Test fun diagnosticsSeparateAudioAndVideoResolutionWithoutChangingQuality() = runBlocking {
-        coEvery { innerTube.resolveAudioStream(any()) } coAnswers {
+        coEvery { innerTube.resolveDownloadStream(any()) } coAnswers {
             kotlinx.coroutines.delay(150)
             val id = firstArg<String>()
             YouTubeAudioStream(id, "https://example.test/$id", 1, "audio/mpeg", "mp3", 128_000,
@@ -164,6 +165,40 @@ class DownloadPipelineIntegrationTest {
         assertTrue(report.contains("logicalAudioBytes=4096"))
         assertFalse(report.contains("example.test"))
         assertFalse(report.contains("Artist"))
+        listOf("REMUX", "FILE_METADATA", "ARTWORK_PREPARE", "ARTWORK_WAIT", "TAG_WRITE", "PUBLIC_COPY", "DB_PUBLISH")
+            .forEach { assertTrue(report, report.contains("$it=")) }
+    }
+
+    @Test fun actualCoverPreparationOverlapsTransfersAndTaggingUsesPreparedBytesWithoutNetwork() = runBlocking {
+        val coverEntered = CountDownLatch(1)
+        val releaseCover = CountDownLatch(1)
+        val image = byteArrayOf(1, 2, 3)
+        coEvery { tagger.prepareArtworkBytes(any(), any()) } coAnswers {
+            coverEntered.countDown()
+            withContext(Dispatchers.IO) { check(releaseCover.await(5, TimeUnit.SECONDS)) }
+            image
+        }
+        onAudio = { check(coverEntered.await(5, TimeUnit.SECONDS)); releaseCover.countDown() }
+        try {
+            enqueue("First", "first123456")
+            withTimeout(10_000) { manager.downloads.first { it.values.any { p -> p.isFinished } } }
+            verify(exactly = 1) { tagger.embedPreparedMetadata(any(), "First", "Artist", "Album", image, null, null) }
+            verify(exactly = 0) { tagger.embedMetadata(any(), any(), any(), any(), any(), any(), any(), any()) }
+            coVerify(exactly = 0) { innerTube.resolveAudioStream(any()) }
+        } finally { releaseCover.countDown() }
+    }
+
+    @Test fun stalledOptionalCoverCannotHoldFinalizationOrCauseASecondTaggingFetch() = runBlocking {
+        val cancelled = CompletableDeferred<Unit>()
+        coEvery { tagger.prepareArtworkBytes(any(), any()) } coAnswers {
+            try { awaitCancellation() } finally { cancelled.complete(Unit) }
+        }
+        enqueue("First", "first123456")
+        val finished = withTimeout(5_000) { manager.downloads.first { it.values.any { p -> p.isFinished } } }.values.single()
+        assertNull(finished.error)
+        withTimeout(5_000) { cancelled.await() }
+        verify(exactly = 1) { tagger.embedPreparedMetadata(any(), "First", "Artist", "Album", null, null, null) }
+        verify(exactly = 0) { tagger.embedMetadata(any(), any(), any(), any(), any(), any(), any(), any()) }
     }
 
     @Test fun optionalVideoMemoryFailureDoesNotCancelSuccessfulAudio() = runBlocking {

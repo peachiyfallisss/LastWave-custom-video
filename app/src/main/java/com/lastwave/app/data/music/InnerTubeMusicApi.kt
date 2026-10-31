@@ -2136,16 +2136,23 @@ class InnerTubeMusicApi @Inject constructor(
         }
     }
 
-    /** Resolves stream specifically optimized for download compatibility (M4A AAC container). */
+    /** Cache, then the successful download extractor immediately; playback clients remain a fallback. */
     suspend fun resolveDownloadStream(videoId: String): YouTubeAudioStream = withContext(Dispatchers.IO) {
         require(videoId.isNotBlank()) { "Missing YouTube Music video id" }
-        try {
-            streamExtractor.resolveAudioStream(videoId, preferM4a = true)
-        } catch (cancellation: kotlinx.coroutines.CancellationException) {
-            throw cancellation
-        } catch (_: Exception) {
-            resolveAudioStream(videoId)
-        }
+        resolveDownloadSource(
+            cached = { peekCachedStream(videoId) },
+            extract = {
+                val stream = kotlinx.coroutines.withTimeoutOrNull(6_000L) {
+                    // Keep the highest-bitrate selection; do not trade quality
+                    // for an AAC preference merely to save remux work.
+                    streamExtractor.resolveAudioStream(videoId)
+                } ?: throw IOException("Download extraction timed out")
+                cacheResolvedStream(stream, System.currentTimeMillis())
+                lastResolvedStreams[resolutionKey(videoId, playbackAuthScope())] = stream
+                stream
+            },
+            fallback = { resolveAudioStream(videoId) },
+        )
     }
 
     /**

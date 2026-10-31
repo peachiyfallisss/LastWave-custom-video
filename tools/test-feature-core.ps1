@@ -46,6 +46,10 @@ try {
         'app/src/main/java/com/lastwave/app/playback/ConcertListeningState.kt',
         'app/src/main/java/com/lastwave/app/playback/InitialPlaybackSource.kt',
         'app/src/main/java/com/lastwave/app/data/download/DownloadEnrichment.kt',
+        'app/src/main/java/com/lastwave/app/data/music/ExpiringSingleFlightCache.kt',
+        'app/src/main/java/com/lastwave/app/data/music/DownloadStreamResolution.kt',
+        'app/src/test/java/com/lastwave/app/data/music/ExpiringSingleFlightCacheTest.kt',
+        'app/src/test/java/com/lastwave/app/data/music/DownloadStreamResolutionTest.kt',
         'app/src/main/java/com/lastwave/app/data/download/DownloadConcurrencyLimiter.kt',
         'app/src/main/java/com/lastwave/app/data/download/DownloadPipeline.kt',
         'app/src/main/java/com/lastwave/app/data/download/DownloadTrace.kt',
@@ -66,7 +70,7 @@ try {
     ) | ForEach-Object { if ([IO.Path]::IsPathRooted($_)) { $_ } else { Join-Path $repo $_ } }
     & java -cp "$KotlinLib\*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -no-reflect -classpath $classpath -d "$temp\classes" @sources
     if ($LASTEXITCODE -ne 0) { throw 'Portable feature-core compilation failed.' }
-    & java -cp "$temp\classes;$classpath" org.junit.runner.JUnitCore com.lastwave.app.data.lyrics.CustomLyricsTest com.lastwave.app.playback.ConcertListeningStateTest com.lastwave.app.playback.InitialPlaybackSourceTest com.lastwave.app.data.download.DownloadEnrichmentTest com.lastwave.app.data.download.DownloadConcurrencyLimiterTest com.lastwave.app.data.download.DownloadPipelineTest com.lastwave.app.data.update.UpdatePolicyTest com.lastwave.app.data.download.DownloadTraceTest com.lastwave.app.data.download.DownloadDiagnosticsNetworkTest com.lastwave.app.data.download.RangedMediaDownloaderTest
+    & java -cp "$temp\classes;$classpath" org.junit.runner.JUnitCore com.lastwave.app.data.lyrics.CustomLyricsTest com.lastwave.app.playback.ConcertListeningStateTest com.lastwave.app.playback.InitialPlaybackSourceTest com.lastwave.app.data.download.DownloadEnrichmentTest com.lastwave.app.data.download.DownloadConcurrencyLimiterTest com.lastwave.app.data.download.DownloadPipelineTest com.lastwave.app.data.update.UpdatePolicyTest com.lastwave.app.data.download.DownloadTraceTest com.lastwave.app.data.download.DownloadDiagnosticsNetworkTest com.lastwave.app.data.download.RangedMediaDownloaderTest com.lastwave.app.data.music.ExpiringSingleFlightCacheTest com.lastwave.app.data.music.DownloadStreamResolutionTest
     if ($LASTEXITCODE -ne 0) { throw 'Feature-core tests failed.' }
 } finally {
     $resolved = [IO.Path]::GetFullPath($temp)

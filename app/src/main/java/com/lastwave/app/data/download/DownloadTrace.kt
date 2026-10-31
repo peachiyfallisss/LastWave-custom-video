@@ -5,7 +5,10 @@ import java.util.Locale
 /** Per-job measurements only. No track names, URLs, cookies, or signed parameters. */
 internal class DownloadTrace(private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }) {
     enum class Role { AUDIO, VIDEO, VIDEO_AUDIO }
-    enum class Phase { PREPARE_METADATA, AUDIO_RESOLVE, VIDEO_RESOLVE, TRANSFER_SLOT_WAIT, FINISH_SLOT_WAIT, FINISHING }
+    enum class Phase {
+        PREPARE_METADATA, AUDIO_RESOLVE, VIDEO_RESOLVE, TRANSFER_SLOT_WAIT, FINISH_SLOT_WAIT, FINISHING,
+        REMUX, FILE_METADATA, LYRICS_WAIT, ARTWORK_PREPARE, ARTWORK_WAIT, TAG_WRITE, PUBLIC_COPY, DB_PUBLISH,
+    }
     internal class Stats {
         var firstStart: Long? = null
         var lastEnd: Long? = null
