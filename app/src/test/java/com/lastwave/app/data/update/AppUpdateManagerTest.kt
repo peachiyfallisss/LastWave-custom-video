@@ -100,7 +100,15 @@ class AppUpdateManagerTest {
         val field = AppUpdateManager::class.java.getDeclaredField("scope").apply { isAccessible = true }
         return (field.get(this) as CoroutineScope).coroutineContext[Job]!!
     }
-    private suspend fun AppUpdateManager.checked() = withTimeout(5_000) { updateInfo.first { !it.isChecking } }
+    private suspend fun AppUpdateManager.checked() = withTimeout(5_000) {
+        val info = updateInfo.first { !it.isChecking }
+        // The flow is published just before the check coroutine's finally block.
+        // Wait for that check to settle before clicking Download; the production
+        // guard intentionally rejects overlapping check/download operations.
+        val field = AppUpdateManager::class.java.getDeclaredField("checkJob").apply { isAccessible = true }
+        (field.get(this@checked) as? Job)?.join()
+        info
+    }
 
     @Test fun sameSemanticVersionUsesBuildCodeAndOnlyVerifiedApkReachesAndroidPermissionScreen() = runBlocking {
         val manager = create()
