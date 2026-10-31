@@ -669,93 +669,14 @@ class TrackDownloadManager @Inject constructor(
 
             try {
                 ensureDownloadStillAllowed()
-                // Never let counter strings ("15 ml listens", "Track 16", "10K views")
-                // leak into filenames, tags or the DB. Callers on fixed code paths
-                // already pass clean values (AlbumDetailScreen safeArtist + hardened
-                // InnerTube parsing), this is the safety net for stale callers and
-                // for the already-queued stat-artist downloads.
-                val rawTitle = title.trim()
-                val rawArtistIsStat = ArtistHelper.isPlayCountOrStat(artist)
-                var safeArtist = artist.trim().takeUnless { ArtistHelper.isPlayCountOrStat(it) }?.ifBlank { null }
-                var safeAlbumInput = album?.trim()?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }?.takeIf { it.isNotBlank() }
-                // If the artist was a counter but the album title is known (album
-                // download case), recover the real artist via search before any
-                // network/stream work so tagging, filenames and DB stay correct.
-                if (safeArtist.isNullOrBlank() && rawTitle.isNotBlank()) {
-                    val recoveryQueryArtist = safeAlbumInput.orEmpty()
-                    val recovered = runCatching {
-                        if (recoveryQueryArtist.isNotBlank()) {
-                            innerTube.findBestMatch(rawTitle, recoveryQueryArtist, prefetchStreams = false)
-                        } else {
-                            innerTube.findBestMatch(rawTitle, "", prefetchStreams = false)
-                        }
-                    }.getOrNull()
-                    val recoveredArtist = recovered?.artist?.trim()
-                        ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                        ?.takeIf { it.isNotBlank() }
-                    if (recoveredArtist != null) {
-                        safeArtist = recoveredArtist
-                        if (safeAlbumInput.isNullOrBlank()) {
-                            safeAlbumInput = recovered.album?.trim()
-                                ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                                ?.takeIf { it.isNotBlank() }
-                        }
-                    }
-                }
-                val effTitle = rawTitle.ifBlank { title.trim() }
-                // Fall back to "Unknown Artist" only for display/filename; the DB
-                // repair pass below will re-resolve it when network allows.
-                val effArtist = safeArtist?.takeIf { it.isNotBlank() } ?: "Unknown Artist"
-                val effArtistForLookup = safeArtist?.takeIf { it.isNotBlank() } ?: ""
-                val artistWasStat = rawArtistIsStat || safeArtist.isNullOrBlank()
-
-                // Resolve missing metadata & cover art proactively
-                var resolvedArtworkUrl = artworkUrl?.takeIf { ArtworkNormalizer.isRealImage(it) }
-                var resolvedAlbum = safeAlbumInput?.takeIf { it.isNotBlank() }
-                var preloadedBestMatch: YouTubeMusicTrack? = null
-
-                // A known recording with valid metadata can resolve its stream immediately.
-                // Album/cover enrichment must not add a redundant blocking player request.
-                if (!videoId.isNullOrBlank() && artistWasStat) {
-                    preloadedBestMatch = runCatching {
-                        innerTube.fetchSongDetails(videoId)
-                    }.getOrNull()
-                }
-
-                if (videoId.isNullOrBlank() && preloadedBestMatch == null && (resolvedArtworkUrl == null || resolvedAlbum == null)) {
-                    preloadedBestMatch = runCatching {
-                        innerTube.findBestMatch(effTitle, effArtistForLookup, prefetchStreams = false)
-                    }.getOrNull()
-                }
-
-                if (preloadedBestMatch != null) {
-                    val cleanMatchArtist = preloadedBestMatch.artist
-                        .takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                    if (artistWasStat && cleanMatchArtist != null && cleanMatchArtist.isNotBlank()) {
-                        safeArtist = cleanMatchArtist.trim()
-                    }
-                    if (resolvedArtworkUrl == null) {
-                        resolvedArtworkUrl = preloadedBestMatch.artworkUrl?.takeIf { ArtworkNormalizer.isRealImage(it) }
-                    }
-                    if (resolvedAlbum == null) {
-                        resolvedAlbum = preloadedBestMatch.album?.trim()
-                            ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                            ?.takeIf { it.isNotBlank() }
-                    }
-                }
-                if (resolvedAlbum != null) {
-                    resolvedAlbum = resolvedAlbum?.trim()
-                        ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
-                        ?.takeIf { it.isNotBlank() }
-                }
-                // Final sanitized values for tagging, filenames, folders and DB.
-                // safeArtist may have been recovered above; effArtist was snapshotted
-                // before, so recompute here.
-                val finalTitle = effTitle
-                val finalArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: effArtist
-                // DB key must never embed a counter string, otherwise one album
-                // fans out into N artists/albums ("15 ml listens", "Track 3"...).
-                val finalKey = makeDownloadKey(finalTitle, finalArtist)
+                val metadata = prepareDownloadMetadata(title, artist, album, artworkUrl, videoId)
+                val finalTitle = metadata.title
+                val finalArtist = metadata.artist
+                val finalKey = metadata.key
+                val safeArtist = metadata.safeArtist
+                var resolvedArtworkUrl = metadata.artworkUrl
+                var resolvedAlbum = metadata.album
+                val preloadedBestMatch = metadata.match
 
                 artworkFallback = if (resolvedArtworkUrl == null) {
                     async(Dispatchers.IO) {
@@ -1318,74 +1239,11 @@ class TrackDownloadManager @Inject constructor(
                     downloadDiagnostics.trace.startPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
                     try {
                         updateStage("Finding YouTube stream…", notify = true)
-                        val lookupArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: ""
-                        // Try both extractors for the same selected video. Never replace a
-                        // failed concert/live upload with a different recording from search.
-                        // Budgeted: a wedged recording must not monopolize a download slot.
-                        val ytFallbackStartMs = android.os.SystemClock.elapsedRealtime()
-                        val ytResolveBudgetMs = 60_000L
-                        val candidateTracks = linkedMapOf<String, YouTubeMusicTrack>()
-                        videoId?.takeIf { it.isNotBlank() }?.let { candidateTracks[it] =
-                            preloadedBestMatch?.takeIf { match -> match.videoId == it }
-                                ?: YouTubeMusicTrack(videoId = it, title = finalTitle, artist = finalArtist)
-                        }
-                        preloadedBestMatch?.videoId?.takeIf { it.isNotBlank() && !isSelectedRecording }?.let { id ->
-                            candidateTracks.putIfAbsent(id, preloadedBestMatch!!)
-                        }
-                        // Broad search is capped inside (10 merged candidates);
-                        // the 60s resolve budget below bounds the slow path.
-                        if (!isSelectedRecording) {
-                            runCatching {
-                                innerTube.findDownloadCandidates(finalTitle, lookupArtist)
-                            }.getOrDefault(emptyList()).forEach { track ->
-                                candidateTracks.putIfAbsent(track.videoId, track)
-                            }
-                        }
-                        // Last resort: legacy single strict match (kept for metadata only).
-                        if (candidateTracks.isEmpty() && !isSelectedRecording) {
-                            runCatching {
-                                innerTube.findBestMatch(finalTitle, lookupArtist, prefetchStreams = false)
-                            }.getOrNull()?.let { track ->
-                                candidateTracks.putIfAbsent(track.videoId, track)
-                            }
-                        }
-                        if (candidateTracks.isEmpty()) throw IOException("No YouTube match found for $finalTitle by $finalArtist")
-                        var pickedStream: com.lastwave.app.data.music.YouTubeAudioStream? = null
-                        var actualVideoId: String? = null
-                        var chosenTrack: YouTubeMusicTrack? = null
-                        var lastResolveError: Throwable? = null
-                        for ((candidateId, candidateTrack) in candidateTracks) {
-                            if (!DownloadRecordingPolicy.mayTryCandidate(videoId, candidateId,
-                                finalTitle, resolvedAlbum, candidateTrack.title, candidateTrack.album, finalArtist)) continue
-                            if (android.os.SystemClock.elapsedRealtime() - ytFallbackStartMs > ytResolveBudgetMs) {
-                                android.util.Log.w(
-                                    "TrackDownloadManager",
-                                    "YouTube resolve budget exhausted for $finalTitle by $finalArtist; skipping remaining candidates",
-                                )
-                                break
-                            }
-                            // Fresh cache, then immediate exact-recording extraction.
-                            // The multi-client playback waterfall is now the fallback,
-                            // not a 4s prerequisite before the extractor that succeeds.
-                            pickedStream = runCatching {
-                                innerTube.resolveDownloadStream(candidateId)
-                            }.getOrElse { error ->
-                                if (error is CancellationException) throw error
-                                lastResolveError = error
-                                null
-                            }
-                            if (pickedStream != null) {
-                                actualVideoId = candidateId
-                                resolvedYtVideoId = candidateId
-                                chosenTrack = candidateTrack
-                                break
-                            }
-                        }
-                        val resolvedStream = pickedStream ?: if (isSelectedRecording) {
-                            throw IOException("Could not download the selected recording. No other version was substituted. Try again while online.", lastResolveError)
-                        } else {
-                            throw (lastResolveError ?: IOException("No playable YouTube stream for $finalTitle by $finalArtist"))
-                        }
+                        val selected = resolveYouTubeDownloadCandidate(videoId, finalTitle, finalArtist,
+                            resolvedAlbum, safeArtist?.trim().orEmpty(), preloadedBestMatch, isSelectedRecording)
+                        val chosenTrack = selected.track
+                        val ytStream = selected.stream
+                        resolvedYtVideoId = selected.videoId
                         if (resolvedArtworkUrl == null) {
                             resolvedArtworkUrl = (chosenTrack?.artworkUrl ?: preloadedBestMatch?.artworkUrl)
                                 ?.takeIf { ArtworkNormalizer.isRealImage(it) }
@@ -1393,7 +1251,6 @@ class TrackDownloadManager @Inject constructor(
                         if (resolvedAlbum == null) resolvedAlbum = (chosenTrack?.album ?: preloadedBestMatch?.album)?.trim()
                             ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
                             ?.takeIf { it.isNotBlank() }
-                        val ytStream = resolvedStream
                         downloadDiagnostics.trace.source(diagnosticId, ytStream.clientProfile, ytStream.bitrate)
                         downloadDiagnostics.trace.endPhase(diagnosticId, DownloadTrace.Phase.AUDIO_RESOLVE)
                         resolvedUrl = ytStream.url
@@ -2002,6 +1859,184 @@ class TrackDownloadManager @Inject constructor(
                 reconnectGenerations.remove(key)
                 tempDownloadFile?.let { runCatching { if (it.exists()) it.delete() } }
             }
+    }
+
+    private data class PreparedMetadata(
+        val title: String, val artist: String, val key: String, val safeArtist: String?,
+        val artworkUrl: String?, val album: String?, val match: YouTubeMusicTrack?,
+    )
+
+    // Keep metadata preparation and candidate selection out of the already large
+    // coroutine state machine (JVM methods have a hard 64 KiB bytecode limit).
+    private suspend fun prepareDownloadMetadata(
+        title: String, artist: String, album: String?, artworkUrl: String?, videoId: String?,
+    ): PreparedMetadata {
+        // Never let counter strings ("15 ml listens", "Track 16", "10K views")
+        // leak into filenames, tags or the DB. Callers on fixed code paths
+        // already pass clean values (AlbumDetailScreen safeArtist + hardened
+        // InnerTube parsing), this is the safety net for stale callers and
+        // for the already-queued stat-artist downloads.
+        val rawTitle = title.trim()
+        val rawArtistIsStat = ArtistHelper.isPlayCountOrStat(artist)
+        var safeArtist = artist.trim().takeUnless { ArtistHelper.isPlayCountOrStat(it) }?.ifBlank { null }
+        var safeAlbumInput = album?.trim()?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }?.takeIf { it.isNotBlank() }
+        // If the artist was a counter but the album title is known (album
+        // download case), recover the real artist via search before any
+        // network/stream work so tagging, filenames and DB stay correct.
+        if (safeArtist.isNullOrBlank() && rawTitle.isNotBlank()) {
+            val recoveryQueryArtist = safeAlbumInput.orEmpty()
+            val recovered = runCatching {
+                if (recoveryQueryArtist.isNotBlank()) {
+                    innerTube.findBestMatch(rawTitle, recoveryQueryArtist, prefetchStreams = false)
+                } else {
+                    innerTube.findBestMatch(rawTitle, "", prefetchStreams = false)
+                }
+            }.getOrNull()
+            val recoveredArtist = recovered?.artist?.trim()
+                ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+                ?.takeIf { it.isNotBlank() }
+            if (recoveredArtist != null) {
+                safeArtist = recoveredArtist
+                if (safeAlbumInput.isNullOrBlank()) {
+                    safeAlbumInput = recovered.album?.trim()
+                        ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+                        ?.takeIf { it.isNotBlank() }
+                }
+            }
+        }
+        val effTitle = rawTitle.ifBlank { title.trim() }
+        // Fall back to "Unknown Artist" only for display/filename; the DB
+        // repair pass below will re-resolve it when network allows.
+        val effArtist = safeArtist?.takeIf { it.isNotBlank() } ?: "Unknown Artist"
+        val effArtistForLookup = safeArtist?.takeIf { it.isNotBlank() } ?: ""
+        val artistWasStat = rawArtistIsStat || safeArtist.isNullOrBlank()
+
+        // Resolve missing metadata & cover art proactively
+        var resolvedArtworkUrl = artworkUrl?.takeIf { ArtworkNormalizer.isRealImage(it) }
+        var resolvedAlbum = safeAlbumInput?.takeIf { it.isNotBlank() }
+        var preloadedBestMatch: YouTubeMusicTrack? = null
+
+        // A known recording with valid metadata can resolve its stream immediately.
+        // Album/cover enrichment must not add a redundant blocking player request.
+        if (!videoId.isNullOrBlank() && artistWasStat) {
+            preloadedBestMatch = runCatching {
+                innerTube.fetchSongDetails(videoId)
+            }.getOrNull()
+        }
+
+        if (videoId.isNullOrBlank() && preloadedBestMatch == null && (resolvedArtworkUrl == null || resolvedAlbum == null)) {
+            preloadedBestMatch = runCatching {
+                innerTube.findBestMatch(effTitle, effArtistForLookup, prefetchStreams = false)
+            }.getOrNull()
+        }
+
+        if (preloadedBestMatch != null) {
+            val cleanMatchArtist = preloadedBestMatch.artist
+                .takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+            if (artistWasStat && cleanMatchArtist != null && cleanMatchArtist.isNotBlank()) {
+                safeArtist = cleanMatchArtist.trim()
+            }
+            if (resolvedArtworkUrl == null) {
+                resolvedArtworkUrl = preloadedBestMatch.artworkUrl?.takeIf { ArtworkNormalizer.isRealImage(it) }
+            }
+            if (resolvedAlbum == null) {
+                resolvedAlbum = preloadedBestMatch.album?.trim()
+                    ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+                    ?.takeIf { it.isNotBlank() }
+            }
+        }
+        if (resolvedAlbum != null) {
+            resolvedAlbum = resolvedAlbum?.trim()
+                ?.takeUnless { ArtistHelper.isPlayCountOrStat(it) }
+                ?.takeIf { it.isNotBlank() }
+        }
+        // Final sanitized values for tagging, filenames, folders and DB.
+        // safeArtist may have been recovered above; effArtist was snapshotted
+        // before, so recompute here.
+        val finalTitle = effTitle
+        val finalArtist = safeArtist?.trim()?.takeIf { it.isNotBlank() } ?: effArtist
+        // DB key must never embed a counter string, otherwise one album
+        // fans out into N artists/albums ("15 ml listens", "Track 3"...).
+        val finalKey = makeDownloadKey(finalTitle, finalArtist)
+        return PreparedMetadata(finalTitle, finalArtist, finalKey, safeArtist, resolvedArtworkUrl, resolvedAlbum, preloadedBestMatch)
+    }
+
+    private data class ResolvedDownloadCandidate(
+        val stream: com.lastwave.app.data.music.YouTubeAudioStream,
+        val videoId: String, val track: YouTubeMusicTrack?,
+    )
+
+    private suspend fun resolveYouTubeDownloadCandidate(
+        videoId: String?, finalTitle: String, finalArtist: String, resolvedAlbum: String?,
+        lookupArtist: String, preloadedBestMatch: YouTubeMusicTrack?, isSelectedRecording: Boolean,
+    ): ResolvedDownloadCandidate {
+        // Try both extractors for the same selected video. Never replace a
+        // failed concert/live upload with a different recording from search.
+        // Budgeted: a wedged recording must not monopolize a download slot.
+        val ytFallbackStartMs = android.os.SystemClock.elapsedRealtime()
+        val ytResolveBudgetMs = 60_000L
+        val candidateTracks = linkedMapOf<String, YouTubeMusicTrack>()
+        videoId?.takeIf { it.isNotBlank() }?.let { candidateTracks[it] =
+            preloadedBestMatch?.takeIf { match -> match.videoId == it }
+                ?: YouTubeMusicTrack(videoId = it, title = finalTitle, artist = finalArtist)
+        }
+        preloadedBestMatch?.videoId?.takeIf { it.isNotBlank() && !isSelectedRecording }?.let { id ->
+            candidateTracks.putIfAbsent(id, preloadedBestMatch!!)
+        }
+        // Broad search is capped inside (10 merged candidates);
+        // the 60s resolve budget below bounds the slow path.
+        if (!isSelectedRecording) {
+            runCatching {
+                innerTube.findDownloadCandidates(finalTitle, lookupArtist)
+            }.getOrDefault(emptyList()).forEach { track ->
+                candidateTracks.putIfAbsent(track.videoId, track)
+            }
+        }
+        // Last resort: legacy single strict match (kept for metadata only).
+        if (candidateTracks.isEmpty() && !isSelectedRecording) {
+            runCatching {
+                innerTube.findBestMatch(finalTitle, lookupArtist, prefetchStreams = false)
+            }.getOrNull()?.let { track ->
+                candidateTracks.putIfAbsent(track.videoId, track)
+            }
+        }
+        if (candidateTracks.isEmpty()) throw IOException("No YouTube match found for $finalTitle by $finalArtist")
+        var pickedStream: com.lastwave.app.data.music.YouTubeAudioStream? = null
+        var actualVideoId: String? = null
+        var chosenTrack: YouTubeMusicTrack? = null
+        var lastResolveError: Throwable? = null
+        for ((candidateId, candidateTrack) in candidateTracks) {
+            if (!DownloadRecordingPolicy.mayTryCandidate(videoId, candidateId,
+                finalTitle, resolvedAlbum, candidateTrack.title, candidateTrack.album, finalArtist)) continue
+            if (android.os.SystemClock.elapsedRealtime() - ytFallbackStartMs > ytResolveBudgetMs) {
+                android.util.Log.w(
+                    "TrackDownloadManager",
+                    "YouTube resolve budget exhausted for $finalTitle by $finalArtist; skipping remaining candidates",
+                )
+                break
+            }
+            // Fresh cache, then immediate exact-recording extraction.
+            // The multi-client playback waterfall is now the fallback,
+            // not a 4s prerequisite before the extractor that succeeds.
+            pickedStream = runCatching {
+                innerTube.resolveDownloadStream(candidateId)
+            }.getOrElse { error ->
+                if (error is CancellationException) throw error
+                lastResolveError = error
+                null
+            }
+            if (pickedStream != null) {
+                actualVideoId = candidateId
+                chosenTrack = candidateTrack
+                break
+            }
+        }
+        val resolvedStream = pickedStream ?: if (isSelectedRecording) {
+            throw IOException("Could not download the selected recording. No other version was substituted. Try again while online.", lastResolveError)
+        } else {
+            throw (lastResolveError ?: IOException("No playable YouTube stream for $finalTitle by $finalArtist"))
+        }
+        return ResolvedDownloadCandidate(resolvedStream, checkNotNull(actualVideoId), chosenTrack)
     }
 
     private suspend fun acquireTransferSlot(lease: DownloadPipeline.Lease, diagnosticId: Long?) {
