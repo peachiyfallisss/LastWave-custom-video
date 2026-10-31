@@ -143,8 +143,7 @@ internal object WebmOpusRemuxer {
                         continue
                     }
 
-                    val packet = ByteArray(read)
-                    repeat(read) { index -> packet[index] = sampleBuffer.get(index) }
+                    val packet = copyCodecPacket(sampleBuffer, read)
                     val packetSamples = opusPacketDurationSamples(packet)
                         ?: throw IllegalArgumentException("Invalid Opus packet in WebM")
                     val packetLacing = packetLacing(read)

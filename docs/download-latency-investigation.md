@@ -150,6 +150,11 @@ addresses identifiable work in the remaining lookup/finalization paths:
   optional artwork can be omitted while title/artist/album/lyrics still get tagged;
   its source URL remains available to the app and missing art is reported honestly.
   No extra background retagging or writes to published files are introduced.
+- WebM-to-Ogg Opus lossless repackaging copies each reported codec packet with
+  one bulk ByteBuffer read instead of a per-byte direct-buffer loop. Tests cover
+  heap/direct/read-only buffers, exact byte equality, sample-size bounds and
+  unchanged input position/limit. Packets, Opus timing, Ogg page generation and
+  quality are unchanged; no decode/re-encode is introduced.
 
 Audio bitrate selection is not lowered to AAC/M4A just to avoid remuxing. Video
 quality, byte-range transfers, exact recording/soundtrack preservation, public
