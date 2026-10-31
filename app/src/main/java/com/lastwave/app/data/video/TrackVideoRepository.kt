@@ -132,7 +132,7 @@ class TrackVideoRepository @Inject constructor(
             folder = destination
             if (!destination.mkdirs()) throw IOException("Cannot create offline video folder.")
             // Both are this video's own streams, never a substituted studio soundtrack.
-            coroutineScope {
+            try { coroutineScope {
                 val progressLock = Any()
                 var videoPercent = 0
                 var audioPercent = 0
@@ -148,6 +148,11 @@ class TrackVideoRepository @Inject constructor(
                 } }
                 copyMedia(stream, File(destination, "video"), diagnosticId?.let { DownloadRequestTag(it, DownloadTrace.Role.VIDEO) }) { progress(video = it) }
                 soundtrack?.await()
+            } } catch (failure: IOException) {
+                // Invalidate the selected video's page ID, never the linked
+                // catalog song when this is a different concert recording.
+                youtubeId(source)?.let(youtube::invalidateCache)
+                throw failure
             }
             videoFileBytes = File(destination, "video").length()
             soundtrackFileBytes = File(destination, "audio").takeIf { it.isFile }?.length() ?: 0L
@@ -260,6 +265,14 @@ class TrackVideoRepository @Inject constructor(
     fun remove(track: PlayableTrack) {
         val identity = identityKey(track)
         preferences.edit().remove(identity).remove("segment-start:$identity").remove("segment-end:$identity").apply()
+    }
+
+    private fun youtubeId(source: String): String? {
+        val url = source.toHttpUrlOrNull() ?: return null
+        if (url.host !in setOf("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")) return null
+        val id = if (url.host == "youtu.be") url.pathSegments.firstOrNull()
+            else url.queryParameter("v") ?: url.pathSegments.lastOrNull()
+        return id?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{11}")) }
     }
 
     suspend fun resolve(source: String): MusicPlayer.ResolvedStream = withContext(Dispatchers.IO) {

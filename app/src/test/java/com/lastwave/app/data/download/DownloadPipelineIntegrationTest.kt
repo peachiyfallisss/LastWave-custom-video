@@ -52,6 +52,7 @@ class DownloadPipelineIntegrationTest {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val httpCount = AtomicInteger()
     private var onAudio: (String) -> Unit = {}
+    private var audioHttpStatus = 200
     private lateinit var manager: TrackDownloadManager
     private val diagnostics = DownloadDiagnostics()
 
@@ -86,7 +87,7 @@ class DownloadPipelineIntegrationTest {
             httpCount.incrementAndGet()
             onAudio(chain.request().url.pathSegments.last())
             val bytes = ByteArray(4_096).apply { "ID3".toByteArray().copyInto(this) }
-            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("test")
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(audioHttpStatus).message("test")
                 .header("Content-Type", "audio/mpeg").body(bytes.toResponseBody()).build()
         }.build()
         manager = TrackDownloadManager(context, innerTube, mockk(relaxed = true), mockk(relaxed = true),
@@ -199,6 +200,15 @@ class DownloadPipelineIntegrationTest {
         withTimeout(5_000) { cancelled.await() }
         verify(exactly = 1) { tagger.embedPreparedMetadata(any(), "First", "Artist", "Album", null, null, null) }
         verify(exactly = 0) { tagger.embedMetadata(any(), any(), any(), any(), any(), any(), any(), any()) }
+    }
+
+    @Test fun failedAudioTransferEvictsRecordingUrlsBeforeUserRetry() = runBlocking {
+        audioHttpStatus = 403
+        enqueue("First", "first123456")
+        val failed = withTimeout(5_000) { manager.downloads.first { it.values.any { p -> p.error != null } } }.values.single()
+        assertFalse(failed.isFinished)
+        verify(exactly = 1) { innerTube.invalidateCache("first123456") }
+        assertTrue(rows.isEmpty())
     }
 
     @Test fun optionalVideoMemoryFailureDoesNotCancelSuccessfulAudio() = runBlocking {

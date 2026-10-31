@@ -35,7 +35,8 @@ class AudioTagWriter @Inject constructor(
         for (url in listOfNotNull(artworkUrl, fallbackUrl).filter(String::isNotBlank).distinct()) {
             try {
                 return@withContext artworkCache.get(url) {
-                    val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+                    val request = Request.Builder().url(url)
+                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36").build()
                     val raw = awaitDownloadResponse(artworkClient.newCall(request)) { response, active ->
                         readArtworkResponse(response, active) ?: throw IOException("No artwork payload")
                     }

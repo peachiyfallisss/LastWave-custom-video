@@ -8,6 +8,8 @@ import com.lastwave.app.playback.PlayableTrack
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
+import io.mockk.every
+import io.mockk.verify
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
@@ -56,6 +58,7 @@ class OfflineVideoTest {
                 .body(bytes.copyOfRange(start, end + 1).toResponseBody()).build()
         }.build()
         val host = if (rangedYoutube) "r1---sn-test.googlevideo.com" else "example.test"
+        every { youtube.invalidateCache(any()) } returns Unit
         coEvery { youtube.resolveVideoStream("live1234567", any()) } answers {
             MusicPlayer.ResolvedStream("https://$host/video", "video/mp4", null, null, "live-video",
                 companionAudio = MusicPlayer.ResolvedStream("https://$host/audio", "audio/mp4", null, null, "live-audio"))
@@ -114,6 +117,17 @@ class OfflineVideoTest {
             assertEquals("saved song", audio.readText())
             assertTrue(File(context.filesDir, "offline-videos").listFiles().orEmpty().isEmpty())
         } finally { audio.delete() }
+    }
+
+    @Test fun failedCustomConcertTransferInvalidatesItsOwnSourceNotTheCatalogSong() = runBlocking {
+        val repo = repository(failAudio = true)
+        repo.save(live, "https://www.youtube.com/watch?v=custom12345")
+        coEvery { youtube.resolveVideoStream("custom12345", any()) } returns MusicPlayer.ResolvedStream(
+            "https://example.test/video", "video/mp4", null, null, "custom",
+            companionAudio = MusicPlayer.ResolvedStream("https://example.test/audio", "audio/mp4", null, null, "custom-audio"))
+        assertTrue(runCatching { repo.downloadVideo(live, emptyList()) { } }.isFailure)
+        verify(exactly = 1) { youtube.invalidateCache("custom12345") }
+        verify(exactly = 0) { youtube.invalidateCache("live1234567") }
     }
 
     @Test fun changingSelectedVideoNeverReusesDifferentOfflineRendition() = runBlocking {

@@ -1550,6 +1550,10 @@ class TrackDownloadManager @Inject constructor(
                     } catch (cancellation: CancellationException) {
                         throw cancellation
                     } catch (ytError: Throwable) {
+                        // The next explicit retry must not reuse this failed
+                        // recording's cached audio/video URLs. Do not wipe player
+                        // JavaScript caches for ordinary transfer/network failures.
+                        resolvedYtVideoId?.let { innerTube.invalidateCache(it) }
                         // Surface the real reason (no match vs no stream vs
                         // network) so a playable song never shows a generic skip.
                         val reason = ytError.localizedMessage?.takeIf { it.isNotBlank() }

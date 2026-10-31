@@ -135,6 +135,10 @@ addresses identifiable work in the remaining lookup/finalization paths:
   minutes. Rejected URL invalidation evicts the response; an old in-flight load
   cannot repopulate the invalidated entry. Account credentials/responses are not
   placed in this anonymous cache.
+- Failed audio/video transfers evict the affected recording's cached URLs before
+  an explicit retry, without clearing global player JavaScript caches on ordinary
+  network failures. A custom concert failure invalidates its selected video ID,
+  not the different catalog song to which it is linked.
 - The synchronous NewPipe downloader bridges into cancellable HTTP reads, tied
   to the extraction caller's job, so a timeout/cancellation cancels and joins its
   active HTTP reader instead of leaving work behind the fallback.
